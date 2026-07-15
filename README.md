@@ -58,6 +58,36 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\deploy-server.ps1 `
 
 生成的密码不会显示在终端，也不会被提交到 GitHub。
 
+### 扩展中的账号和密码怎么填
+
+扩展里填写的是 **Browser Gateway 代理服务器的账号和密码**，不是 ChatGPT、Chrome、SSH 或 Windows 的登录账号。
+
+部署脚本会将完整连接信息保存在执行部署的电脑上：
+
+```text
+C:\Users\<Windows 用户名>\.browser-gateway\deployment.local.json
+```
+
+在这台电脑的 PowerShell 中运行下面的命令可以直接打开该文件：
+
+```powershell
+notepad "$HOME\.browser-gateway\deployment.local.json"
+```
+
+将文件字段对应填入扩展：
+
+| JSON 字段 | 扩展输入框 |
+|---|---|
+| `host` | 服务器 |
+| `port` | 端口 |
+| `username` | 用户名 |
+| `password` | 密码 |
+| `expectedIp` | 预期出口 IP |
+
+如果扩展已经保存过密码，密码框留空表示保留现有密码；首次配置或更换电脑时不能留空。
+
+在部署服务器的同一台电脑上，脚本还会生成被 Git 忽略的 `extension/runtime-config.json`，扩展首次加载时通常会自动导入这些信息。另一台电脑默认没有凭据文件，需要通过安全的离线方式取得上述字段后再填写。不要把凭据文件提交到 GitHub、粘贴到聊天记录或通过公开链接传输。
+
 ## 安装 Chrome 扩展
 
 1. 在 Chrome 中打开 `chrome://extensions`。
