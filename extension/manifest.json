@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Browser Gateway",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Routes this Chrome profile through a private HTTPS proxy.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6/W7aqSoLvZPnJ20CWGkv/Xy3mODLPH7IPgxN03TLkbaloK8UAdav6dRujRreOvnva/0dXrR0FY6rBmC8mMZ+hD6pCcvCTI0FZiKqyq+imigPP+/O1Uzc7v1fhmIP0e8I+KWaCQ1aZ2PX1iOvxbSJ5oYZU1IRyC6Bh993CXb8KJPohj2KsR9c2o/S2K+WfJbNVpYv+WX1O2AuOYkx+4ObVkFswvlx/u0djgbIEUHH4wJ39rymRlvdt+Ymxh90UFhkR69WuJ0VyjI1O/R5jPSQ5Ce+RBfa6AYaa0FSWB4Eq3XaIIRWxCOJ34NNcoQlLpU0IHnFRMu5hfa7Ah3QhNsjwIDAQAB",
   "minimum_chrome_version": "116",
@@ -11,10 +11,7 @@
     "webRequest",
     "webRequestAuthProvider"
   ],
-  "host_permissions": [
-    "http://*/*",
-    "https://*/*"
-  ],
+  "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "src/background.js",
     "type": "module"

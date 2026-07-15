@@ -17,6 +17,7 @@ let configPromise = null;
 let lastProxyError = null;
 let lastTest = null;
 let restorePromise = null;
+const AUTH_PRIME_URL = "https://api.ipify.org/?browser-gateway-auth-prime=1";
 
 function currentConfig() {
   if (!configPromise) {
@@ -57,13 +58,13 @@ chrome.webRequest.onAuthRequired.addListener(
       callback({ authCredentials: { username: config.username, password: config.password } });
     }).catch(() => callback({ cancel: true }));
   },
-  { urls: ["http://*/*", "https://*/*"] },
+  { urls: ["<all_urls>"] },
   ["asyncBlocking"],
 );
 
 for (const event of [chrome.webRequest.onCompleted, chrome.webRequest.onErrorOccurred]) {
   event.addListener((details) => authAttempts.delete(details.requestId), {
-    urls: ["http://*/*", "https://*/*"],
+    urls: ["<all_urls>"],
   });
 }
 
@@ -173,6 +174,29 @@ async function restore() {
       if (!isConfiguredProxy(proxy, config)) {
         await enableProxy(chrome.proxy.settings, config);
       }
+      // Chrome restores tabs, extensions, and WebSockets immediately after
+      // startup. Prime its proxy-auth cache with the saved credentials before
+      // those restored requests can fall back to the native auth dialog.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch(AUTH_PRIME_URL, {
+          cache: "no-store",
+          credentials: "omit",
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error(`认证预热返回 HTTP ${response.status}`);
+        lastProxyError = null;
+      } catch (error) {
+        lastProxyError = {
+          error: "AUTH_PRIME_FAILED",
+          details: error?.message ?? String(error),
+          fatal: false,
+          at: new Date().toISOString(),
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
     } catch (error) {
       lastProxyError = {
         error: "RESTORE_FAILED",
@@ -195,3 +219,8 @@ function restoreOnce() {
 
 chrome.runtime.onInstalled.addListener(() => restoreOnce());
 chrome.runtime.onStartup.addListener(() => restoreOnce());
+
+// Start loading encrypted extension storage as soon as the worker wakes. The
+// onAuthRequired callback can then answer a cold-start challenge with minimal
+// delay instead of beginning its first storage read at challenge time.
+void currentConfig().catch(() => {});
