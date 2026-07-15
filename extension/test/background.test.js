@@ -6,9 +6,10 @@ class FakeEvent {
   addListener(listener) { this.listeners.push(listener); }
 }
 
-function createChrome() {
-  const storage = {};
+function createChrome(initialConfig = null) {
+  const storage = initialConfig ? { gatewayConfig: structuredClone(initialConfig) } : {};
   let proxyState = { levelOfControl: "controllable_by_this_extension", value: { mode: "system" } };
+  let proxySetCount = 0;
   const runtimeMessage = new FakeEvent();
   const authRequired = new FakeEvent();
   return {
@@ -29,6 +30,7 @@ function createChrome() {
       settings: {
         get(_details, callback) { callback(structuredClone(proxyState)); },
         set(details, callback) {
+          proxySetCount += 1;
           proxyState = { levelOfControl: "controlled_by_this_extension", value: details.value };
           callback();
         },
@@ -45,6 +47,7 @@ function createChrome() {
       onErrorOccurred: new FakeEvent(),
     },
     __events: { runtimeMessage, authRequired },
+    __proxySetCount() { return proxySetCount; },
   };
 }
 
@@ -92,4 +95,37 @@ test("background saves credentials, controls the proxy, authenticates narrowly, 
   const disabled = await send(listener, { type: "SET_ENABLED", enabled: false });
   assert.equal(disabled.config.enabled, false);
   assert.equal(disabled.active, false);
+});
+
+test("cold startup restores the proxy once and serves stored credentials", async () => {
+  globalThis.chrome = createChrome({
+    host: "38.207.167.51",
+    port: 443,
+    username: "cold-user",
+    password: "cold-password",
+    expectedIp: "38.207.167.51",
+    enabled: true,
+  });
+  globalThis.fetch = async () => ({
+    ok: true,
+    async json() { return { ip: "38.207.167.51" }; },
+  });
+  await import(`../src/background.js?cold=${Date.now()}`);
+
+  const startup = chrome.runtime.onStartup.listeners[0];
+  const first = startup();
+  const second = startup();
+  await Promise.all([first, second]);
+  assert.equal(chrome.__proxySetCount(), 1);
+
+  const authListener = chrome.__events.authRequired.listeners[0];
+  const accepted = await new Promise((resolve) => authListener({
+    requestId: "cold-one",
+    isProxy: true,
+    challenger: { host: "38.207.167.51", port: 443 },
+  }, resolve));
+  assert.deepEqual(accepted.authCredentials, {
+    username: "cold-user",
+    password: "cold-password",
+  });
 });

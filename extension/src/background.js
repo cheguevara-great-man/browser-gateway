@@ -16,6 +16,7 @@ const authAttempts = new Map();
 let configPromise = null;
 let lastProxyError = null;
 let lastTest = null;
+let restorePromise = null;
 
 function currentConfig() {
   if (!configPromise) {
@@ -180,6 +181,14 @@ async function restore() {
   }
 }
 
-chrome.runtime.onInstalled.addListener(() => restore());
-chrome.runtime.onStartup.addListener(() => restore());
-restore();
+function restoreOnce() {
+  if (!restorePromise) {
+    restorePromise = restore().finally(() => {
+      restorePromise = null;
+    });
+  }
+  return restorePromise;
+}
+
+chrome.runtime.onInstalled.addListener(() => restoreOnce());
+chrome.runtime.onStartup.addListener(() => restoreOnce());
