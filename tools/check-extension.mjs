@@ -8,6 +8,9 @@ for (const permission of requiredPermissions) {
 }
 if (manifest.manifest_version !== 3) throw new Error("Manifest V3 is required");
 if (!manifest.key) throw new Error("A stable extension identity key is required");
+if (!manifest.host_permissions?.includes("<all_urls>")) {
+  throw new Error("Proxy authentication must cover restored HTTP and WebSocket requests");
+}
 
 const digest = new Uint8Array(await webcrypto.subtle.digest("SHA-256", Buffer.from(manifest.key, "base64")));
 const alphabet = "abcdefghijklmnop";

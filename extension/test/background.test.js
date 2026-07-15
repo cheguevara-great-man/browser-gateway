@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 
 class FakeEvent {
   listeners = [];
-  addListener(listener) { this.listeners.push(listener); }
+  registrations = [];
+  addListener(listener, filter, extraInfoSpec) {
+    this.listeners.push(listener);
+    this.registrations.push({ listener, filter, extraInfoSpec });
+  }
 }
 
 function createChrome(initialConfig = null) {
@@ -106,10 +110,14 @@ test("cold startup restores the proxy once and serves stored credentials", async
     expectedIp: "38.207.167.51",
     enabled: true,
   });
-  globalThis.fetch = async () => ({
+  const fetched = [];
+  globalThis.fetch = async (url) => {
+    fetched.push(String(url));
+    return ({
     ok: true,
     async json() { return { ip: "38.207.167.51" }; },
-  });
+    });
+  };
   await import(`../src/background.js?cold=${Date.now()}`);
 
   const startup = chrome.runtime.onStartup.listeners[0];
@@ -117,12 +125,18 @@ test("cold startup restores the proxy once and serves stored credentials", async
   const second = startup();
   await Promise.all([first, second]);
   assert.equal(chrome.__proxySetCount(), 1);
+  assert.deepEqual(fetched, ["https://api.ipify.org/?browser-gateway-auth-prime=1"]);
+
+  const registration = chrome.__events.authRequired.registrations[0];
+  assert.deepEqual(registration.filter, { urls: ["<all_urls>"] });
+  assert.deepEqual(registration.extraInfoSpec, ["asyncBlocking"]);
 
   // A later worker startup must not reset an already identical proxy. Resetting
   // Chrome proxy settings also resets its authentication state and can trigger
   // a native username/password prompt.
   await startup();
   assert.equal(chrome.__proxySetCount(), 1);
+  assert.equal(fetched.length, 2);
 
   const authListener = chrome.__events.authRequired.listeners[0];
   const accepted = await new Promise((resolve) => authListener({
@@ -131,6 +145,15 @@ test("cold startup restores the proxy once and serves stored credentials", async
     challenger: { host: "38.207.167.51", port: 443 },
   }, resolve));
   assert.deepEqual(accepted.authCredentials, {
+    username: "cold-user",
+    password: "cold-password",
+  });
+
+  const websocket = await new Promise((resolve) => authListener({
+    requestId: "cold-wss", url: "wss://chatgpt.com/socket",
+    isProxy: true, challenger: { host: "38.207.167.51", port: 443 },
+  }, resolve));
+  assert.deepEqual(websocket.authCredentials, {
     username: "cold-user",
     password: "cold-password",
   });
