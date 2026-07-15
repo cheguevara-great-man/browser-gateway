@@ -169,7 +169,10 @@ async function restore() {
   if (config.enabled) {
     try {
       assertReady(config);
-      await enableProxy(chrome.proxy.settings, config);
+      const proxy = await getProxyState(chrome.proxy.settings);
+      if (!isConfiguredProxy(proxy, config)) {
+        await enableProxy(chrome.proxy.settings, config);
+      }
     } catch (error) {
       lastProxyError = {
         error: "RESTORE_FAILED",
