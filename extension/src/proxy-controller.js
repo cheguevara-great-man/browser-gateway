@@ -71,5 +71,3 @@ export function isConfiguredProxy(details, config) {
     && String(proxy?.host ?? "").toLowerCase() === config.host.toLowerCase()
     && Number(proxy?.port) === config.port;
 }
-
-\n

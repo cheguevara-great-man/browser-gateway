@@ -16,5 +16,3 @@ const extensionId = [...digest.slice(0, 16)]
   .join("");
 
 console.log(`extension manifest: OK (${extensionId})`);
-
-\n

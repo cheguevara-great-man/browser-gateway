@@ -35,5 +35,3 @@ form button { grid-column: 1 / -1; }
 .details span { color: #748094; }
 .details strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
-
-\n

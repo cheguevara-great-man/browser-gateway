@@ -101,5 +101,3 @@ message({ type: "GET_STATE" })
   .then((next) => render(next, true))
   .catch((error) => showNotice(error?.message ?? String(error), true))
   .finally(() => setBusy(false));
-
-\n

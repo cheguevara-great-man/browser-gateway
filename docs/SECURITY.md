@@ -1,12 +1,22 @@
-# Security
+# 安全说明
 
-- Never commit `deployment.local.json`, `extension/runtime-config.json`, or the generated proxy password. Both files are ignored by Git.
-- The proxy must never run without authentication.
-- Each device should eventually receive an independent credential so it can be revoked separately.
-- The extension supplies credentials only for a proxy challenge whose host and port exactly match its saved server.
-- The popup never reads the stored password back from the background worker.
-- `runtime-config.json` is imported into Chrome storage on first load; it exists only to avoid manually copying the generated password and is not web-accessible to normal pages.
-- The server blocks private, loopback, link-local, self-referential, and non-Web destination ports.
-- Certificate renewal runs twice daily because Let's Encrypt IP certificates are short-lived.
-- Browser proxy credentials are protected against network interception by TLS, but `chrome.storage.local` is not a defense against malware already running as the Windows user.
-- Rotate any SSH password or proxy credential that has been exposed in chat, logs, screenshots, or a support bundle.
+## 凭据保护
+
+- 不要提交 `deployment.local.json`、`extension/runtime-config.json` 或自动生成的代理密码。这些文件已被 `.gitignore` 排除。
+- 代理服务必须始终启用身份验证，不能以无密码方式对公网开放。
+- 建议以后为每台电脑分配独立凭据，以便单独撤销某台设备的访问权限。
+- 扩展只会在代理认证请求的主机和端口与已保存服务器完全一致时提供用户名和密码。
+- 弹出窗口不会从后台读取并显示已保存的密码。
+- `runtime-config.json` 只用于首次加载时将部署配置导入 Chrome 存储，普通网页无法直接访问该文件。
+
+## 服务器限制
+
+- 服务器阻止访问内网、回环、链路本地地址、服务器自身地址以及非 Web 端口。
+- TLS 证书自动续期任务每天检查两次，因为 Let's Encrypt 的 IP 地址证书有效期较短。
+- TLS 可以防止代理凭据在网络传输途中被窃听。
+
+## 本机安全边界
+
+代理密码保存在 `chrome.storage.local`。这可以避免网页直接读取密码，但不能抵御已经以当前 Windows 用户身份运行的恶意软件。
+
+如果 SSH 密码、SSH 私钥或代理凭据曾出现在聊天记录、终端日志、截图或支持文件中，应立即更换相应凭据。

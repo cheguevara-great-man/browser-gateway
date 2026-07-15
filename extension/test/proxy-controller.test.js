@@ -25,5 +25,3 @@ test("refuses to overwrite another extension proxy", async () => {
   };
   await assert.rejects(() => enableProxy(settings, config), /其他扩展控制/);
 });
-
-\n

@@ -32,5 +32,3 @@ test("rejects URLs and invalid ports as proxy hosts", () => {
 test("requires credentials before enabling", () => {
   assert.throws(() => assertReady(DEFAULT_CONFIG), /用户名和密码/);
 });
-
-\n

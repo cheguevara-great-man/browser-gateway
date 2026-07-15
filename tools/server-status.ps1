@@ -13,5 +13,3 @@ openssl x509 -in /etc/browser-gateway/tls/fullchain.pem -noout -subject -issuer 
 journalctl -u browser-gateway.service -n 20 --no-pager
 '@
 if ($LASTEXITCODE -ne 0) { throw 'Server health check failed.' }
-
-\n
