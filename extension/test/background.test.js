@@ -118,6 +118,12 @@ test("cold startup restores the proxy once and serves stored credentials", async
   await Promise.all([first, second]);
   assert.equal(chrome.__proxySetCount(), 1);
 
+  // A later worker startup must not reset an already identical proxy. Resetting
+  // Chrome proxy settings also resets its authentication state and can trigger
+  // a native username/password prompt.
+  await startup();
+  assert.equal(chrome.__proxySetCount(), 1);
+
   const authListener = chrome.__events.authRequired.listeners[0];
   const accepted = await new Promise((resolve) => authListener({
     requestId: "cold-one",
