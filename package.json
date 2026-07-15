@@ -1,0 +1,15 @@
+{
+  "name": "browser-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test extension/test/*.test.js",
+    "check": "node tools/check-extension.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
+
+\n

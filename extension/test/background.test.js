@@ -1,0 +1,95 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+class FakeEvent {
+  listeners = [];
+  addListener(listener) { this.listeners.push(listener); }
+}
+
+function createChrome() {
+  const storage = {};
+  let proxyState = { levelOfControl: "controllable_by_this_extension", value: { mode: "system" } };
+  const runtimeMessage = new FakeEvent();
+  const authRequired = new FakeEvent();
+  return {
+    storage: {
+      local: {
+        async get(key) { return key in storage ? { [key]: storage[key] } : {}; },
+        async set(values) { Object.assign(storage, values); },
+      },
+    },
+    runtime: {
+      lastError: null,
+      getURL(path) { return `chrome-extension://test/${path}`; },
+      onInstalled: new FakeEvent(),
+      onStartup: new FakeEvent(),
+      onMessage: runtimeMessage,
+    },
+    proxy: {
+      settings: {
+        get(_details, callback) { callback(structuredClone(proxyState)); },
+        set(details, callback) {
+          proxyState = { levelOfControl: "controlled_by_this_extension", value: details.value };
+          callback();
+        },
+        clear(_details, callback) {
+          proxyState = { levelOfControl: "controllable_by_this_extension", value: { mode: "system" } };
+          callback();
+        },
+      },
+      onProxyError: new FakeEvent(),
+    },
+    webRequest: {
+      onAuthRequired: authRequired,
+      onCompleted: new FakeEvent(),
+      onErrorOccurred: new FakeEvent(),
+    },
+    __events: { runtimeMessage, authRequired },
+  };
+}
+
+function send(listener, payload) {
+  return new Promise((resolve) => listener(payload, {}, resolve));
+}
+
+test("background saves credentials, controls the proxy, authenticates narrowly, and tests egress", async () => {
+  globalThis.chrome = createChrome();
+  globalThis.fetch = async (url) => String(url).endsWith("runtime-config.json")
+    ? { ok: false }
+    : { ok: true, async json() { return { ip: "38.207.167.51" }; } };
+  await import(`../src/background.js?test=${Date.now()}`);
+
+  const listener = chrome.__events.runtimeMessage.listeners[0];
+  const saved = await send(listener, {
+    type: "SAVE_CONFIG",
+    config: {
+      host: "38.207.167.51", port: 443, username: "test-user", password: "test-password",
+      expectedIp: "38.207.167.51",
+    },
+  });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.config.hasPassword, true);
+  assert.equal("password" in saved.config, false);
+
+  const enabled = await send(listener, { type: "SET_ENABLED", enabled: true });
+  assert.equal(enabled.active, true);
+
+  const authListener = chrome.__events.authRequired.listeners[0];
+  const accepted = await new Promise((resolve) => authListener({
+    requestId: "one", isProxy: true, challenger: { host: "38.207.167.51", port: 443 },
+  }, resolve));
+  assert.deepEqual(accepted.authCredentials, { username: "test-user", password: "test-password" });
+
+  const refused = await new Promise((resolve) => authListener({
+    requestId: "two", isProxy: true, challenger: { host: "other.example", port: 443 },
+  }, resolve));
+  assert.deepEqual(refused, {});
+
+  const tested = await send(listener, { type: "TEST_CONNECTION" });
+  assert.equal(tested.lastTest.ip, "38.207.167.51");
+  assert.equal(tested.lastTest.ok, true);
+
+  const disabled = await send(listener, { type: "SET_ENABLED", enabled: false });
+  assert.equal(disabled.config.enabled, false);
+  assert.equal(disabled.active, false);
+});

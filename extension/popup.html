@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Browser Gateway</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Browser Gateway</h1>
+          <p>私人美国出口</p>
+        </div>
+        <span id="stateBadge" class="badge off">未开启</span>
+      </header>
+
+      <section id="notice" class="notice hidden" role="status"></section>
+
+      <form id="settingsForm">
+        <label>服务器
+          <input id="host" autocomplete="off" required>
+        </label>
+        <label class="small">端口
+          <input id="port" type="number" min="1" max="65535" required>
+        </label>
+        <label>用户名
+          <input id="username" autocomplete="username" required>
+        </label>
+        <label>密码
+          <input id="password" type="password" autocomplete="current-password" placeholder="留空保持现有密码">
+        </label>
+        <label>预期出口 IP
+          <input id="expectedIp" autocomplete="off">
+        </label>
+        <button id="saveButton" class="secondary" type="submit">保存设置</button>
+      </form>
+
+      <section class="details">
+        <div><span>Chrome 控制权</span><strong id="control">—</strong></div>
+        <div><span>检测出口</span><strong id="egress">尚未检测</strong></div>
+        <div><span>检测延迟</span><strong id="latency">—</strong></div>
+      </section>
+
+      <div class="actions">
+        <button id="toggleButton" class="primary" type="button">开启代理</button>
+        <button id="testButton" class="secondary" type="button">检测连接</button>
+      </div>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
+
+\n

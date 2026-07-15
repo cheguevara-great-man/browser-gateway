@@ -1,0 +1,39 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+  color: #18212f;
+  background: #f5f7fb;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; width: 360px; }
+main { padding: 18px; }
+header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; }
+h1 { font-size: 19px; margin: 0 0 3px; letter-spacing: -.2px; }
+header p { margin: 0; color: #718096; font-size: 12px; }
+.badge { padding: 5px 9px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+.badge.on { color: #087443; background: #d9f7e8; }
+.badge.off { color: #805400; background: #fff0c2; }
+.badge.error { color: #a32222; background: #ffe0e0; }
+.notice { border-radius: 8px; padding: 9px 11px; margin-bottom: 12px; font-size: 12px; line-height: 1.45; background: #e9f1ff; color: #234a80; }
+.notice.error { background: #ffe6e6; color: #8d2020; }
+.hidden { display: none; }
+form { display: grid; grid-template-columns: 1fr 86px; gap: 10px; }
+label { grid-column: 1 / -1; color: #536174; font-size: 12px; font-weight: 600; }
+label.small { grid-column: 2; grid-row: 1; }
+label:first-child { grid-column: 1; }
+input { width: 100%; margin-top: 5px; padding: 9px 10px; border: 1px solid #ccd4df; border-radius: 7px; background: white; color: #18212f; outline: none; }
+input:focus { border-color: #4779e6; box-shadow: 0 0 0 3px rgba(71,121,230,.12); }
+button { border: 0; border-radius: 8px; padding: 10px 12px; font-weight: 700; cursor: pointer; }
+button:disabled { opacity: .55; cursor: wait; }
+.primary { color: white; background: #3267d6; }
+.primary.danger { background: #c14343; }
+.secondary { color: #2e4f86; background: #e7edf7; }
+form button { grid-column: 1 / -1; }
+.details { margin: 14px 0; padding: 10px 12px; background: white; border: 1px solid #e1e6ee; border-radius: 9px; }
+.details div { display: flex; justify-content: space-between; gap: 14px; padding: 4px 0; font-size: 12px; }
+.details span { color: #748094; }
+.details strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+
+\n

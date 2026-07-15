@@ -1,0 +1,6 @@
+.DS_Store
+*.zip
+coverage/
+node_modules/
+deployment.local.json
+extension/runtime-config.json
