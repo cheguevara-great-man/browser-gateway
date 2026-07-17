@@ -220,8 +220,7 @@ function restoreOnce() {
 chrome.runtime.onInstalled.addListener(() => restoreOnce());
 chrome.runtime.onStartup.addListener(() => restoreOnce());
 
-// Restore and prime on every service-worker cold start, not only when Chrome
-// happens to deliver runtime.onStartup. Restored tabs can begin proxy requests
-// before that event is handled; starting here narrows that race and preloads
-// credentials for onAuthRequired at the earliest possible point.
-void restoreOnce();
+// Start loading encrypted extension storage as soon as the worker wakes. The
+// onAuthRequired callback can then answer a cold-start challenge with minimal
+// delay instead of beginning its first storage read at challenge time.
+void currentConfig().catch(() => {});
