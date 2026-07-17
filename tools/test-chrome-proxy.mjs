@@ -21,19 +21,20 @@ const extensionId = [...crypto.createHash("sha256").update(Buffer.from(manifest.
   .join("");
 const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), "browser-gateway-chromium-"));
 const netLogPath = path.join(userDataDir, "netlog.json");
+const launchOptions = {
+  channel: "chromium",
+  headless: true,
+  args: [
+    `--disable-extensions-except=${extensionPath}`,
+    `--load-extension=${extensionPath}`,
+    `--log-net-log=${netLogPath}`,
+    "--net-log-capture-mode=Default",
+  ],
+};
 
 let context;
 try {
-  context = await chromium.launchPersistentContext(userDataDir, {
-    channel: "chromium",
-    headless: true,
-    args: [
-      `--disable-extensions-except=${extensionPath}`,
-      `--load-extension=${extensionPath}`,
-      `--log-net-log=${netLogPath}`,
-      "--net-log-capture-mode=Default",
-    ],
-  });
+  context = await chromium.launchPersistentContext(userDataDir, launchOptions);
 
   // manifest.json contains a stable public key, so unpacked installs use a
   // deterministic ID. Opening the popup also wakes the MV3 service worker.
@@ -89,6 +90,22 @@ try {
   await context.close();
   context = null;
 
+  // Relaunch the same profile without opening the extension UI or supplying
+  // credentials again. This catches the real cold-start race that otherwise
+  // presents Chrome's native proxy username/password dialog.
+  const restartStarted = performance.now();
+  context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+  const restartPage = await context.newPage();
+  await restartPage.goto("https://api.ipify.org?format=json&after-restart=1", {
+    waitUntil: "domcontentloaded",
+    timeout: 30_000,
+  });
+  const restartEgress = JSON.parse(await restartPage.textContent("body"));
+  assert.equal(restartEgress.ip, credentials.expectedIp, "cold restart lost proxy authentication");
+  const restartRequestMs = Math.round(performance.now() - restartStarted);
+  await context.close();
+  context = null;
+
   const netLog = JSON.parse(await fs.readFile(netLogPath, "utf8"));
   const typeNames = new Map(
     Object.entries(netLog.constants?.logEventTypes ?? {}).map(([name, id]) => [id, name]),
@@ -104,6 +121,7 @@ try {
     firstRequestMs,
     warmRequestMs,
     warmSamplesMs,
+    restartRequestMs,
     http2Events: h2Events.length,
     proxyHttp2Events: proxyH2Events.length,
   }));
