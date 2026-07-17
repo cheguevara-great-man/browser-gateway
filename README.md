@@ -130,4 +130,4 @@ node .\tools\test-chrome-proxy.mjs "$HOME\.browser-gateway\deployment.local.json
 - `server/install-h2.sh`：推荐的 HTTP/2 服务器安装器。
 - `server/install.sh`：旧版单层 HTTP/1.1 安装器，仅用于回退。
 - `tools/`：部署、状态、安全测试和真实浏览器验收工具。
-- `docs/`：[架构说明](docs/ARCHITECTURE.md)与[安全说明](docs/SECURITY.md)。
+- `docs/`：[架构说明](docs/ARCHITECTURE.md)、[安全说明](docs/SECURITY.md)与[中央 Token 统计](docs/TOKEN_USAGE.md)。

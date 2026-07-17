@@ -42,4 +42,13 @@ $disallowedPort = @('--silent', '--show-error', '--fail', '--output', 'NUL',
     '--proxy', $proxy, '--proxy-user', $authentication, '--max-time', '12', 'https://example.com:22')
 if (-not (Test-CurlFails $disallowedPort)) { throw 'The proxy allowed a non-Web destination port.' }
 
+if ($credential.usageCollectorUrl) {
+    $usageHealth = ([uri]$credential.usageCollectorUrl).GetLeftPart([System.UriPartial]::Authority) + '/health'
+    $health = & curl.exe --silent --show-error --fail `
+        --proxy $proxy --proxy-user $authentication --max-time 20 $usageHealth
+    if ($LASTEXITCODE -ne 0 -or ($health | ConvertFrom-Json).status -ne 'ok') {
+        throw 'Central token usage collector health check failed through the browser gateway.'
+    }
+}
+
 Write-Host "Server security tests: OK (egress $($egress.Trim()))" -ForegroundColor Green

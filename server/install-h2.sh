@@ -14,6 +14,11 @@ TLS_ROOT="$CONFIG_ROOT/tls"
 CREDENTIALS_FILE="/root/browser-gateway-credentials.json"
 WEBROOT="/var/www/html"
 POLICY_PORT="18088"
+USAGE_PORT="9443"
+USAGE_BACKEND_PORT="19443"
+USAGE_SOURCE="/root/browser-gateway-usage-collector.py"
+USAGE_CREDENTIALS="$CONFIG_ROOT/usage-credentials.json"
+USAGE_ADMIN_FILE="/root/browser-gateway-usage-admin.json"
 
 fail() { echo "browser-gateway: $*" >&2; exit 1; }
 
@@ -35,6 +40,13 @@ fi
 if ss -ltnH "sport = :${POLICY_PORT}" | grep -q . && ! systemctl is-active --quiet browser-gateway-egress.service; then
   fail "local policy port ${POLICY_PORT} is already used by another service"
 fi
+if ss -ltnH "sport = :${USAGE_PORT}" | grep -q . && ! systemctl is-active --quiet browser-gateway-usage.service; then
+  fail "token usage port ${USAGE_PORT} is already used by another service"
+fi
+if ss -ltnH "sport = :${USAGE_BACKEND_PORT}" | grep -q . && ! systemctl is-active --quiet browser-gateway-usage.service; then
+  fail "local token usage backend port ${USAGE_BACKEND_PORT} is already used by another service"
+fi
+[[ -s "$USAGE_SOURCE" ]] || fail "usage collector was not uploaded"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -44,11 +56,14 @@ if ! getent passwd browser-gateway >/dev/null; then
   useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin browser-gateway
 fi
 install -d -o root -g browser-gateway -m 0750 "$APP_ROOT/bin" "$CONFIG_ROOT" "$TLS_ROOT"
+install -d -o browser-gateway -g browser-gateway -m 0750 /var/lib/browser-gateway
 install -d -o root -g root -m 0700 /root/browser-gateway-backups
 
 backup="/root/browser-gateway-backups/$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 backup_items=()
-for item in "$CONFIG_ROOT" /etc/systemd/system/browser-gateway.service /etc/systemd/system/browser-gateway-egress.service; do
+for item in "$CONFIG_ROOT" /etc/systemd/system/browser-gateway.service \
+  /etc/systemd/system/browser-gateway-egress.service \
+  /etc/systemd/system/browser-gateway-usage.service; do
   [[ -e "$item" ]] && backup_items+=("${item#/}")
 done
 if ((${#backup_items[@]})); then
@@ -132,6 +147,28 @@ fi
 gateway_user="$(jq -er '.username' "$CREDENTIALS_FILE")"
 gateway_password="$(jq -er '.password' "$CREDENTIALS_FILE")"
 
+if [[ ! -s "$USAGE_CREDENTIALS" ]]; then
+  report_token="$(openssl rand -hex 32)"
+  admin_token="$(openssl rand -hex 32)"
+  jq -n --arg report_token "$report_token" --arg admin_token "$admin_token" \
+    '{report_token:$report_token,admin_token:$admin_token}' > "$USAGE_CREDENTIALS.next"
+  install -o root -g browser-gateway -m 0640 "$USAGE_CREDENTIALS.next" "$USAGE_CREDENTIALS"
+  rm -f "$USAGE_CREDENTIALS.next"
+fi
+report_token="$(jq -er '.report_token' "$USAGE_CREDENTIALS")"
+admin_token="$(jq -er '.admin_token' "$USAGE_CREDENTIALS")"
+tmp_credentials="$work_root/client-credentials.json"
+jq --arg usage_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/events" \
+   --arg report_token "$report_token" \
+   '.usageCollectorUrl=$usage_url | .usageReportToken=$report_token' \
+   "$CREDENTIALS_FILE" > "$tmp_credentials"
+install -o root -g root -m 0600 "$tmp_credentials" "$CREDENTIALS_FILE"
+jq -n --arg summary_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/summary" \
+  --arg admin_token "$admin_token" \
+  '{summaryUrl:$summary_url,adminToken:$admin_token}' > "$USAGE_ADMIN_FILE"
+chmod 0600 "$USAGE_ADMIN_FILE"
+install -o root -g root -m 0755 "$USAGE_SOURCE" "$APP_ROOT/bin/usage_collector.py"
+
 install -d -m 0755 /usr/local/libexec
 cat > /usr/local/libexec/browser-gateway-refresh-cert <<EOF
 #!/usr/bin/env bash
@@ -143,11 +180,16 @@ mv -f ${TLS_ROOT}/privkey.pem.next ${TLS_ROOT}/privkey.pem
 if systemctl is-active --quiet browser-gateway.service; then
   systemctl restart browser-gateway.service
 fi
+if systemctl is-active --quiet browser-gateway-usage.service; then
+  systemctl restart browser-gateway-usage.service
+fi
+nginx -t >/dev/null
+systemctl reload nginx
 EOF
 chmod 0755 /usr/local/libexec/browser-gateway-refresh-cert
 /usr/local/libexec/browser-gateway-refresh-cert
 
-jq -n --argjson port "$POLICY_PORT" --arg ip "$PUBLIC_IP" '{
+jq -n --argjson port "$POLICY_PORT" --argjson usage_port "$USAGE_PORT" --arg ip "$PUBLIC_IP" '{
   log:{level:"warn",timestamp:true},
   dns:{servers:[{type:"local",tag:"local"}]},
   inbounds:[{type:"http",tag:"policy-in",listen:"127.0.0.1",listen_port:$port}],
@@ -156,6 +198,7 @@ jq -n --argjson port "$POLICY_PORT" --arg ip "$PUBLIC_IP" '{
     default_domain_resolver:"local",
     rules:[
       {action:"resolve",server:"local"},
+      {ip_cidr:[($ip + "/32")],port:[$usage_port],action:"route",outbound:"direct"},
       {ip_cidr:[($ip + "/32")],action:"reject"},
       {ip_is_private:true,action:"reject"},
       {port:[80,443],action:"route",outbound:"direct"},
@@ -166,6 +209,29 @@ jq -n --argjson port "$POLICY_PORT" --arg ip "$PUBLIC_IP" '{
 }' > "$CONFIG_ROOT/egress.json.next"
 install -o root -g browser-gateway -m 0640 "$CONFIG_ROOT/egress.json.next" "$CONFIG_ROOT/egress.json"
 rm -f "$CONFIG_ROOT/egress.json.next"
+
+cat > /etc/nginx/conf.d/browser-gateway-usage.conf <<EOF
+limit_req_zone \$binary_remote_addr zone=browser_gateway_usage:10m rate=10r/s;
+server {
+  listen ${USAGE_PORT} ssl;
+  server_name _;
+  ssl_certificate ${TLS_ROOT}/fullchain.pem;
+  ssl_certificate_key ${TLS_ROOT}/privkey.pem;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  client_max_body_size 256k;
+  location / {
+    limit_req zone=browser_gateway_usage burst=30 nodelay;
+    proxy_pass http://127.0.0.1:${USAGE_BACKEND_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header Connection "";
+    proxy_connect_timeout 3s;
+    proxy_read_timeout 15s;
+  }
+}
+EOF
+nginx -t
+systemctl reload nginx
 
 jq -n \
   --arg addr ":${LISTEN_PORT}" \
@@ -260,6 +326,41 @@ UMask=0077
 WantedBy=multi-user.target
 EOF
 
+cat > /etc/systemd/system/browser-gateway-usage.service <<EOF
+[Unit]
+Description=Browser Gateway central token usage collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=browser-gateway
+Group=browser-gateway
+ExecStart=/usr/bin/python3 ${APP_ROOT}/bin/usage_collector.py --port ${USAGE_BACKEND_PORT} --database /var/lib/browser-gateway/usage.sqlite3 --credentials ${USAGE_CREDENTIALS}
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/browser-gateway
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+MemoryMax=128M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 cat > /usr/local/libexec/browser-gateway-health <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -335,10 +436,11 @@ EOF
 
 "$APP_ROOT/bin/sing-box" check -c "$CONFIG_ROOT/egress.json"
 systemctl daemon-reload
-systemctl enable browser-gateway-egress.service browser-gateway.service \
+systemctl enable browser-gateway-egress.service browser-gateway.service browser-gateway-usage.service \
   browser-gateway-health.timer browser-gateway-cert-renew.timer
 systemctl restart browser-gateway-egress.service
 systemctl restart browser-gateway.service
+systemctl restart browser-gateway-usage.service
 systemctl start browser-gateway-health.timer browser-gateway-cert-renew.timer
 sleep 2
 systemctl is-active --quiet browser-gateway-egress.service || fail "policy egress failed to start"
@@ -346,7 +448,14 @@ systemctl is-active --quiet browser-gateway.service || {
   journalctl -u browser-gateway.service -n 50 --no-pager >&2
   fail "HTTP/2 gateway failed to start"
 }
+systemctl is-active --quiet browser-gateway-usage.service || {
+  journalctl -u browser-gateway-usage.service -n 50 --no-pager >&2
+  fail "token usage collector failed to start"
+}
 ss -ltnH "sport = :${LISTEN_PORT}" | grep -q . || fail "gateway did not bind TCP ${LISTEN_PORT}"
+ss -ltnH "sport = :${USAGE_PORT}" | grep -q . || fail "usage collector did not bind TCP ${USAGE_PORT}"
+ss -ltnH "sport = :${USAGE_BACKEND_PORT}" | grep -q . || fail "usage collector backend did not bind TCP ${USAGE_BACKEND_PORT}"
 
 echo "Browser Gateway HTTP/2 installed on TCP ${LISTEN_PORT}."
 echo "Credentials remain in ${CREDENTIALS_FILE}."
+echo "Usage administrator credentials remain in ${USAGE_ADMIN_FILE}."
