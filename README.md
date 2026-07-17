@@ -33,7 +33,7 @@ sing-box 安全出口策略
 
 准备条件：
 
-- Debian 12（amd64）服务器，公网可访问 TCP 22、80 和 443。
+- Debian 12（amd64）服务器，公网可访问 TCP 22、80、443；启用中央 Token 统计时还需在云防火墙/安全组放行 TCP 9443。
 - Windows 已配置可以登录服务器 root 用户的 SSH 密钥。
 - 本机安装了 Git、Node.js 22+ 和 PowerShell。
 

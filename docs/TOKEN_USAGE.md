@@ -4,6 +4,9 @@ Browser Gateway 可以在同一台服务器上运行独立的 Token 用量收集
 汇总 Codex 用量。收集器使用服务器现有的可信 IP TLS 证书，默认监听 TCP `9443`，数据保存在
 `/var/lib/browser-gateway/usage.sqlite3`。
 
+部署前需要在云服务器防火墙或安全组中放行 TCP `9443`。Bridge 的上报请求仍封装在现有浏览器
+代理连接中；该端口只用于服务器端经过 TLS 和 Bearer 密钥验证的统计 API。
+
 ## 安全设计
 
 - 上报密钥和管理查询密钥相互独立；普通电脑不能读取汇总。
