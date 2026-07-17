@@ -150,13 +150,27 @@ gateway_password="$(jq -er '.password' "$CREDENTIALS_FILE")"
 if [[ ! -s "$USAGE_CREDENTIALS" ]]; then
   report_token="$(openssl rand -hex 32)"
   admin_token="$(openssl rand -hex 32)"
+  dashboard_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+  session_secret="$(openssl rand -hex 32)"
   jq -n --arg report_token "$report_token" --arg admin_token "$admin_token" \
-    '{report_token:$report_token,admin_token:$admin_token}' > "$USAGE_CREDENTIALS.next"
+    --arg dashboard_password "$dashboard_password" --arg session_secret "$session_secret" \
+    '{report_token:$report_token,admin_token:$admin_token,dashboard_username:"admin",dashboard_password:$dashboard_password,session_secret:$session_secret}' > "$USAGE_CREDENTIALS.next"
+  install -o root -g browser-gateway -m 0640 "$USAGE_CREDENTIALS.next" "$USAGE_CREDENTIALS"
+  rm -f "$USAGE_CREDENTIALS.next"
+fi
+if [[ "$(jq -r '.dashboard_password // empty' "$USAGE_CREDENTIALS")" == "" ]]; then
+  dashboard_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+  session_secret="$(openssl rand -hex 32)"
+  jq --arg dashboard_password "$dashboard_password" --arg session_secret "$session_secret" \
+    '.dashboard_username="admin" | .dashboard_password=$dashboard_password | .session_secret=$session_secret' \
+    "$USAGE_CREDENTIALS" > "$USAGE_CREDENTIALS.next"
   install -o root -g browser-gateway -m 0640 "$USAGE_CREDENTIALS.next" "$USAGE_CREDENTIALS"
   rm -f "$USAGE_CREDENTIALS.next"
 fi
 report_token="$(jq -er '.report_token' "$USAGE_CREDENTIALS")"
 admin_token="$(jq -er '.admin_token' "$USAGE_CREDENTIALS")"
+dashboard_username="$(jq -er '.dashboard_username' "$USAGE_CREDENTIALS")"
+dashboard_password="$(jq -er '.dashboard_password' "$USAGE_CREDENTIALS")"
 tmp_credentials="$work_root/client-credentials.json"
 jq --arg usage_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/events" \
    --arg report_token "$report_token" \
@@ -164,8 +178,10 @@ jq --arg usage_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/events" \
    "$CREDENTIALS_FILE" > "$tmp_credentials"
 install -o root -g root -m 0600 "$tmp_credentials" "$CREDENTIALS_FILE"
 jq -n --arg summary_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/summary" \
-  --arg admin_token "$admin_token" \
-  '{summaryUrl:$summary_url,adminToken:$admin_token}' > "$USAGE_ADMIN_FILE"
+  --arg dashboard_url "https://${PUBLIC_IP}:${USAGE_PORT}/dashboard" \
+  --arg admin_token "$admin_token" --arg dashboard_username "$dashboard_username" \
+  --arg dashboard_password "$dashboard_password" \
+  '{summaryUrl:$summary_url,adminToken:$admin_token,dashboardUrl:$dashboard_url,dashboardUsername:$dashboard_username,dashboardPassword:$dashboard_password}' > "$USAGE_ADMIN_FILE"
 chmod 0600 "$USAGE_ADMIN_FILE"
 install -o root -g root -m 0755 "$USAGE_SOURCE" "$APP_ROOT/bin/usage_collector.py"
 

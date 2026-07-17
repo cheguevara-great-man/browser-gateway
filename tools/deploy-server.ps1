@@ -43,6 +43,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Failed to restrict the usage administrator cre
 
 $extensionBootstrap = Join-Path $root 'extension\runtime-config.json'
 $gatewayCredential = Get-Content -LiteralPath $LocalCredentialPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$usageAdminCredential = Get-Content -LiteralPath $UsageAdminCredentialPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $extensionCredential = [ordered]@{
     host = [string]$gatewayCredential.host
     port = [int]$gatewayCredential.port
@@ -60,5 +61,6 @@ $extensionCredential = [ordered]@{
 Write-Host "Browser Gateway HTTP/2 server deployed successfully on TCP $Port." -ForegroundColor Green
 Write-Host "Credentials saved locally at: $LocalCredentialPath"
 Write-Host "Usage administrator credentials saved locally at: $UsageAdminCredentialPath"
+Write-Host "Usage dashboard: $($usageAdminCredential.dashboardUrl)"
 Write-Host "Extension bootstrap created at: $extensionBootstrap"
 Write-Host 'Credential values were not printed and both local files are excluded from Git.'

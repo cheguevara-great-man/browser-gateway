@@ -3,5 +3,7 @@
 coverage/
 node_modules/
 __pycache__/
+.playwright-cli/
+output/playwright/
 deployment*.local.json
 extension/runtime-config.json
