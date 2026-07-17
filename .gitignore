@@ -2,5 +2,5 @@
 *.zip
 coverage/
 node_modules/
-deployment.local.json
+deployment*.local.json
 extension/runtime-config.json

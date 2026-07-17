@@ -1,16 +1,10 @@
 # Browser Gateway（浏览器网关）
 
-Browser Gateway 是一个配合 Browser AI Bridge 使用的 Chrome HTTPS 代理扩展。它让 Chrome（以及 Bridge 在 Chrome 中执行的网络请求）通过你自己的境外服务器访问互联网，无需在 Windows 上安装 VPN 客户端。
+Browser Gateway 是一个供 Chrome 使用的私有 HTTPS 代理扩展。它让 Chrome，以及 Browser AI Bridge 交给 Chrome 执行的请求，通过你自己的境外服务器访问互联网；Windows 不需要安装 VPN 客户端，也不会开放本地通用代理端口。
 
-## 适用范围
+当前版本为 **0.2.0**。服务器链路支持 HTTP/2 连接复用、账号认证、可信 TLS 证书、目标访问限制、健康检查和证书自动续期。
 
-- 只代理当前 Chrome 配置文件，不是 Windows 全局 VPN。
-- 不在本机开放通用的 SOCKS 或 HTTP 代理端口。
-- 可以与 Clash 规则模式共存：启用本扩展时由本扩展接管 Chrome；关闭后清除本扩展设置。
-- 如果 FanVPN 或其他扩展正在控制 Chrome 代理，本扩展会检测并提示冲突。
-- 服务器端使用带身份验证和 TLS 加密的独立 HTTPS 代理。
-
-## 工作原理
+## 请求链路
 
 ```text
 VS Code Codex / Claude
@@ -18,63 +12,74 @@ VS Code Codex / Claude
 Browser AI Bridge（127.0.0.1:18888）
         ↓
 Chrome + Browser Gateway 扩展
+        ↓ HTTPS + HTTP/2 + 账号认证
+GOST 公网入口（服务器 TCP 443）
+        ↓ 127.0.0.1 回环
+sing-box 安全出口策略
         ↓
-自己的境外服务器
-        ↓
-境外互联网
+目标网站
 ```
 
-更详细的说明见[架构文档](docs/ARCHITECTURE.md)和[安全说明](docs/SECURITY.md)。
+这里的 sing-box 是 Browser Gateway 自己的独立实例，只负责阻止内网、服务器自身及非 Web 端口，不接管服务器上的其他代理服务。详见[架构说明](docs/ARCHITECTURE.md)。
 
-## 目录结构
+## 适用范围
 
-- `extension/`：可通过“加载已解压的扩展程序”安装的 Chrome Manifest V3 扩展。
-- `server/`：可重复执行的 Debian 服务器安装脚本。
-- `tools/`：部署、测试和诊断工具。
-- `docs/`：架构与安全说明。
+- 只接管安装扩展的 Chrome 配置文件，不是 Windows 全局代理。
+- 可以与 Clash 规则模式共存；启用扩展时由扩展接管 Chrome，关闭后清除本扩展设置。
+- Chrome 同一时间只能由一个扩展控制代理。启用前应关闭 FanVPN 或其他代理扩展。
+- Browser AI Bridge 仍需正常运行在 `127.0.0.1:18888`。
 
-## 部署服务器
+## 一键部署服务器
 
 准备条件：
 
-- 一台 Debian 服务器，外部可以访问其 22 和 443 端口。
-- Windows 已有可登录服务器 `root` 用户的 SSH 密钥。
-- Windows 已安装 Node.js 22 或更高版本。
+- Debian 12（amd64）服务器，公网可访问 TCP 22、80 和 443。
+- Windows 已配置可以登录服务器 root 用户的 SSH 密钥。
+- 本机安装了 Git、Node.js 22+ 和 PowerShell。
 
-在仓库根目录的 PowerShell 中运行：
+在仓库根目录的 **PowerShell** 中运行：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\deploy-server.ps1 `
-  -Server '<服务器 IP>' `
+  -Server '<服务器公网 IP>' `
+  -IdentityFile "$HOME\.ssh\browser_gateway_ed25519" `
+  -LocalCredentialPath "$HOME\.browser-gateway\deployment.local.json"
+```
+
+端口默认是 443。脚本会安装经过 SHA-256 校验的 GOST 和 sing-box、申请 Let's Encrypt IP 证书、生成随机代理凭据、配置 systemd 服务及定时健康检查。重复执行同一命令可安全更新配置和程序。
+
+凭据只保存在服务器 root 目录和本机指定的 JSON 文件中，不会显示在终端，也不会提交到 GitHub。脚本同时生成被 Git 忽略的 `extension/runtime-config.json`，供本机首次加载扩展时导入。
+
+确认部署和测试成功后，可执行一次安全加固。该命令会先验证密钥登录，再禁用 SSH 密码登录并启用 Debian 自动安全更新：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\harden-server.ps1 `
+  -Server '<服务器公网 IP>' `
   -IdentityFile "$HOME\.ssh\browser_gateway_ed25519"
 ```
 
-安装脚本会：
+加固后仍可用同一私钥登录 root，但不能再用 root 密码通过 SSH 登录。请保留云服务商控制台的救援入口。
 
-1. 安装独立的 HTTPS 代理服务。
-2. 生成随机用户名和密码。
-3. 申请可信的 TLS 证书并配置自动续期。
-4. 将连接信息保存到本机被 Git 忽略的文件中。
+## 安装 Chrome 扩展
 
-生成的密码不会显示在终端，也不会被提交到 GitHub。
+1. 在 Chrome 打开 `chrome://extensions`。
+2. 开启右上角的**开发者模式**。
+3. 点击**加载已解压的扩展程序**，选择本仓库的 `extension` 文件夹。
+4. 打开 **Browser Gateway**，确认服务器、端口和账号已导入；若没有导入，按下一节手工填写。
+5. 依次点击**保存设置**、**开启代理**和**检测连接**。
+6. 检测出口应等于服务器公网 IP，状态应显示“已连接”。
 
-### 扩展中的账号和密码怎么填
+## 账号和密码填什么
 
-扩展里填写的是 **Browser Gateway 代理服务器的账号和密码**，不是 ChatGPT、Chrome、SSH 或 Windows 的登录账号。
+这里填写的是 **Browser Gateway 代理账号**，不是 ChatGPT、Chrome、Windows 或 SSH 的账号。
 
-部署脚本会将完整连接信息保存在执行部署的电脑上：
-
-```text
-C:\Users\<Windows 用户名>\.browser-gateway\deployment.local.json
-```
-
-在这台电脑的 PowerShell 中运行下面的命令可以直接打开该文件：
+部署电脑上的凭据文件位于你传给 `-LocalCredentialPath` 的位置。使用上面的示例时，在 PowerShell 中这样打开：
 
 ```powershell
 notepad "$HOME\.browser-gateway\deployment.local.json"
 ```
 
-将文件字段对应填入扩展：
+字段对应关系：
 
 | JSON 字段 | 扩展输入框 |
 |---|---|
@@ -84,35 +89,45 @@ notepad "$HOME\.browser-gateway\deployment.local.json"
 | `password` | 密码 |
 | `expectedIp` | 预期出口 IP |
 
-如果扩展已经保存过密码，密码框留空表示保留现有密码；首次配置或更换电脑时不能留空。
+首次配置时密码不能留空。以后保存过密码后，密码框留空表示保留现有密码。不要把凭据文件上传 GitHub、粘贴到公开聊天或通过公开链接传输。
 
-保存正确凭据后，扩展会自动响应与已配置服务器完全匹配的 Chrome 代理认证，不需要在
-Chrome 的认证弹窗中重复输入。如果重启 Chrome 后仍出现弹窗，先在扩展中重新输入正确密码并
-点击“保存设置”，再刷新扩展；只在 Chrome 弹窗中输入的密码仅由当前浏览器会话临时缓存。
-扩展冷启动时如果检测到相同代理已经生效，不会重复写入 Chrome 代理设置，以免重置认证状态；
-同时会提前载入已保存的凭据、覆盖 HTTP/HTTPS/WebSocket 认证挑战，并主动预热 Chrome 的
-代理认证缓存，避免恢复标签页时出现原生账号密码弹窗。
+## 验收和诊断
 
-在部署服务器的同一台电脑上，脚本还会生成被 Git 忽略的 `extension/runtime-config.json`，扩展首次加载时通常会自动导入这些信息。另一台电脑默认没有凭据文件，需要通过安全的离线方式取得上述字段后再填写。不要把凭据文件提交到 GitHub、粘贴到聊天记录或通过公开链接传输。
-
-## 安装 Chrome 扩展
-
-1. 在 Chrome 中打开 `chrome://extensions`。
-2. 开启右上角的**开发者模式**。
-3. 点击**加载已解压的扩展程序**，选择本仓库中的 `extension` 文件夹。
-4. 打开 **Browser Gateway**，依次点击**保存设置**和**开启代理**。
-5. 点击**检测连接**，确认检测出口与服务器 IP 相同。
-
-Chrome 同一时间只能由一个扩展控制代理。启用 Browser Gateway 前，请先关闭 FanVPN 或其他代理扩展。
-
-Browser AI Bridge 仍需正常运行在 `127.0.0.1:18888`。Bridge 交给 Chrome 执行的请求会自动通过 Browser Gateway，无需修改 Windows 全局代理。
-
-## 测试与检查
+代码与扩展测试：
 
 ```powershell
-npm test
-npm run check
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\test-server.ps1
+npm.cmd test
+npm.cmd run check
 ```
 
-本项目已经完成真实服务器验证，包括扩展控制、代理身份验证、服务器路由限制、Chrome 出口检测和 Browser AI Bridge 联调。
+服务器安全策略和出口测试：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\test-server.ps1 `
+  -CredentialPath "$HOME\.browser-gateway\deployment.local.json"
+```
+
+服务器服务、监听端口、证书和最近日志：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\server-status.ps1 `
+  -Server '<服务器公网 IP>'
+```
+
+项目还提供可选的真实 Chromium 验收脚本，用来确认扩展接管、出口 IP、GitHub/ChatGPT 访问和代理 HTTP/2 会话。它只用于开发诊断，需要先安装 Playwright 及其 Chromium：
+
+```powershell
+npm.cmd install --no-save --package-lock=false playwright
+npx.cmd playwright install chromium
+node .\tools\test-chrome-proxy.mjs "$HOME\.browser-gateway\deployment.local.json"
+```
+
+输出中的 `proxyHttp2Events` 大于 0 表示 Chrome 已经对代理使用 HTTP/2。
+
+## 目录
+
+- `extension/`：Chrome Manifest V3 扩展。
+- `server/install-h2.sh`：推荐的 HTTP/2 服务器安装器。
+- `server/install.sh`：旧版单层 HTTP/1.1 安装器，仅用于回退。
+- `tools/`：部署、状态、安全测试和真实浏览器验收工具。
+- `docs/`：[架构说明](docs/ARCHITECTURE.md)与[安全说明](docs/SECURITY.md)。

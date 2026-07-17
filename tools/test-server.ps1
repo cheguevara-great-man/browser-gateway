@@ -33,8 +33,9 @@ $invalidAuthentication = @('--silent', '--show-error', '--fail', '--output', 'NU
     '--proxy', $proxy, '--proxy-user', 'invalid:invalid', '--max-time', '12', 'https://example.com')
 if (-not (Test-CurlFails $invalidAuthentication)) { throw 'The proxy accepted invalid credentials.' }
 
-$privateDestination = @('--silent', '--show-error', '--fail', '--output', 'NUL', '--noproxy', '',
-    '--proxy', $proxy, '--proxy-user', $authentication, '--max-time', '12', 'http://127.0.0.1/')
+$privateDestination = @('--silent', '--show-error', '--fail', '--output', 'NUL', '--noproxy', '_',
+    '--proxytunnel', '--proxy', $proxy, '--proxy-user', $authentication, '--max-time', '12',
+    'http://127.0.0.1/')
 if (-not (Test-CurlFails $privateDestination)) { throw 'The proxy allowed a private destination.' }
 
 $disallowedPort = @('--silent', '--show-error', '--fail', '--output', 'NUL',
