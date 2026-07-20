@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 
 MAX_BODY = 256 * 1024
+BEIJING = timezone(timedelta(hours=8))
 
 # Official Codex token-based rate card, credits per one million tokens.
 # Unknown future models deliberately remain unrated until configured in the dashboard.
@@ -79,10 +80,10 @@ class Handler(BaseHTTPRequestHandler):
             if session is None:
                 self._html(200, login_page(error=parse_qs(path.query).get("error") == ["1"]))
                 return
-            days = _query_days(path.query)
+            days, start_date, end_date = _query_scope(path.query, self.server.database)
             page = {
                 "/dashboard": "overview",
-                "/dashboard/daily": "daily",
+                "/dashboard/daily": "overview",
                 "/dashboard/machines": "machines",
                 "/dashboard/models": "models",
                 "/dashboard/settings": "settings",
@@ -93,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             query = parse_qs(path.query)
             self._html(200, dashboard_page(
-                summary(self.server.database, days), session[0], session[1], days,
+                summary(self.server.database, days, start_date, end_date), session[0], session[1], days,
                 self.server.session_secret, page=page,
                 machine_id=query.get("id", [""])[0],
             ))
@@ -104,26 +105,45 @@ class Handler(BaseHTTPRequestHandler):
         if path.path == "/health":
             self._json(200, {"status": "ok"})
             return
+        if path.path == "/v1/usage/policy":
+            if not self._authorized(self.server.report_token):
+                self._json(401, {"error": "unauthorized"})
+                return
+            machine_id = parse_qs(path.query).get("machine_id", [""])[0]
+            try:
+                self._json(200, machine_policy(self.server.database, machine_id))
+            except ValueError:
+                self._json(400, {"error": "invalid_machine"})
+            return
         if path.path != "/v1/usage/summary":
             self._json(404, {"error": "not_found"})
             return
-        if not self._authorized(self.server.admin_token):
+        if not self._authorized(self.server.admin_token) and self._session() is None:
             self._json(401, {"error": "unauthorized"})
             return
-        try:
-            days = int(parse_qs(path.query).get("days", ["30"])[0])
-        except ValueError:
-            days = 30
-        days = min(max(days, 1), 366)
-        self._json(200, summary(self.server.database, days))
+        days, start_date, end_date = _query_scope(path.query, self.server.database)
+        self._json(200, summary(self.server.database, days, start_date, end_date))
 
     def do_POST(self):  # noqa: N802
         path = urlsplit(self.path).path
         if path == "/login":
             self._login()
             return
-        if path in {"/dashboard/rate", "/dashboard/budget"}:
+        if path in {"/dashboard/rate", "/dashboard/budget", "/dashboard/control"}:
             self._dashboard_update(path)
+            return
+        if path == "/v1/usage/quota":
+            if not self._authorized(self.server.report_token):
+                self._discard_body()
+                self._json(401, {"error": "unauthorized"})
+                return
+            try:
+                value = self._json_body()
+                quota = insert_quota_snapshot(self.server.database, value)
+            except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+                self._json(400, {"error": "invalid_quota"})
+                return
+            self._json(202, {"accepted": True, "quota": quota})
             return
         if path != "/v1/usage/events":
             self._json(404, {"error": "not_found"})
@@ -133,11 +153,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(401, {"error": "unauthorized"})
             return
         try:
-            length = int(self.headers.get("Content-Length", "-1"))
-            if not 1 <= length <= MAX_BODY:
-                raise ValueError("invalid body length")
-            raw = self.rfile.read(length)
-            value = json.loads(raw)
+            value = self._json_body()
             events = value if isinstance(value, list) else [value]
             if not 1 <= len(events) <= 100:
                 raise ValueError("invalid event count")
@@ -146,6 +162,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "invalid_event"})
             return
         self._json(202, {"accepted": accepted})
+
+    def _json_body(self) -> object:
+        length = int(self.headers.get("Content-Length", "-1"))
+        if not 1 <= length <= MAX_BODY:
+            raise ValueError("invalid body length")
+        return json.loads(self.rfile.read(length))
 
     def _login(self) -> None:
         try:
@@ -205,9 +227,18 @@ class Handler(BaseHTTPRequestHandler):
                     float(form.get("cached_rate", [""])[0]),
                     float(form.get("output_rate", [""])[0]),
                 )
-            else:
+            elif path == "/dashboard/budget":
                 raw_budget = form.get("budget", [""])[0].strip()
                 set_budget(self.server.database, days, float(raw_budget) if raw_budget else None)
+            else:
+                set_control_settings(
+                    self.server.database,
+                    start_date=form.get("start_date", [""])[0],
+                    end_date=form.get("end_date", [""])[0],
+                    budget=float(form.get("budget", [""])[0]) if form.get("budget", [""])[0] else None,
+                    machine_slots=int(form.get("machine_slots", ["6"])[0]),
+                    hard_cap=form.get("hard_cap", [""])[0] == "on",
+                )
         except (ValueError, OverflowError):
             self._redirect(f"/dashboard?{urlencode({'days': days, 'error': 1})}")
             return
@@ -316,6 +347,20 @@ def initialize(path: Path) -> None:
                 setting_key TEXT PRIMARY KEY,
                 setting_value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS quota_snapshots(
+                observed_at TEXT NOT NULL,
+                machine_id TEXT NOT NULL,
+                plan_type TEXT NOT NULL,
+                used_percent REAL NOT NULL,
+                allowed INTEGER NOT NULL,
+                limit_reached INTEGER NOT NULL,
+                window_seconds INTEGER NOT NULL,
+                reset_at INTEGER NOT NULL,
+                received_at TEXT NOT NULL,
+                PRIMARY KEY(observed_at, machine_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_quota_observed_at
+                ON quota_snapshots(observed_at DESC);
             """
         )
         columns = {row[1] for row in database.execute("PRAGMA table_info(usage_events)")}
@@ -392,25 +437,158 @@ def validate_event(value: object) -> tuple[object, ...]:
     return (*strings, *numbers)
 
 
-def summary(path: Path, days: int) -> dict[str, object]:
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+def insert_quota_snapshot(path: Path, value: object) -> dict[str, object]:
+    required = {
+        "machine_id", "observed_at", "plan_type", "used_percent", "allowed",
+        "limit_reached", "limit_window_seconds", "reset_at",
+    }
+    if not isinstance(value, dict) or frozenset(value) != frozenset(required):
+        raise ValueError("invalid quota fields")
+    machine_id = value["machine_id"]
+    observed_at = value["observed_at"]
+    plan_type = value["plan_type"]
+    if not all(isinstance(item, str) and item for item in (machine_id, observed_at, plan_type)):
+        raise ValueError("invalid quota strings")
+    if len(machine_id) > 64 or len(observed_at) > 64 or len(plan_type) > 32:
+        raise ValueError("quota string too long")
+    observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    if observed.tzinfo is None:
+        raise ValueError("quota timestamp needs timezone")
+    used_percent = value["used_percent"]
+    if isinstance(used_percent, bool) or not isinstance(used_percent, (int, float)) or not 0 <= used_percent <= 100:
+        raise ValueError("invalid used percent")
+    allowed = value["allowed"]
+    limit_reached = value["limit_reached"]
+    if not isinstance(allowed, bool) or not isinstance(limit_reached, bool):
+        raise ValueError("invalid quota flags")
+    window_seconds = value["limit_window_seconds"]
+    reset_at = value["reset_at"]
+    if (
+        isinstance(window_seconds, bool) or not isinstance(window_seconds, int)
+        or not 60 <= window_seconds <= 31 * 86400
+        or isinstance(reset_at, bool) or not isinstance(reset_at, int)
+        or reset_at <= 0
+    ):
+        raise ValueError("invalid quota window")
+    received_at = datetime.now(timezone.utc).isoformat()
+    with closing(connect(path)) as database, database:
+        database.execute(
+            """INSERT OR REPLACE INTO quota_snapshots(
+                observed_at,machine_id,plan_type,used_percent,allowed,limit_reached,
+                window_seconds,reset_at,received_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                observed_at, machine_id, plan_type[:32], float(used_percent), int(allowed),
+                int(limit_reached), window_seconds, reset_at, received_at,
+            ),
+        )
+        database.execute(
+            "DELETE FROM quota_snapshots WHERE received_at < ?",
+            ((datetime.now(timezone.utc) - timedelta(days=90)).isoformat(),),
+        )
+    return latest_quota(path) or {}
+
+
+def latest_quota(path: Path) -> dict[str, object] | None:
+    with closing(connect(path)) as database:
+        row = database.execute(
+            """SELECT observed_at,machine_id,plan_type,used_percent,allowed,limit_reached,
+                      window_seconds,reset_at,received_at
+                 FROM quota_snapshots ORDER BY observed_at DESC LIMIT 1"""
+        ).fetchone()
+    if row is None:
+        return None
+    reset = datetime.fromtimestamp(row[7], timezone.utc)
+    start = reset - timedelta(seconds=row[6])
+    observed = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+    return {
+        "observed_at": row[0], "machine_id": row[1], "plan_type": row[2],
+        "used_percent": round(float(row[3]), 2),
+        "remaining_percent": round(max(100.0 - float(row[3]), 0.0), 2),
+        "allowed": bool(row[4]), "limit_reached": bool(row[5]),
+        "limit_window_seconds": int(row[6]), "reset_at": reset.isoformat(),
+        "period_start_at": start.isoformat(), "period_end_at": reset.isoformat(),
+        "period_start": start.astimezone(BEIJING).date().isoformat(),
+        "period_end": reset.astimezone(BEIJING).date().isoformat(),
+        "stale": datetime.now(timezone.utc) - observed > timedelta(minutes=20),
+    }
+
+
+def _control_settings(path: Path) -> dict[str, object]:
+    with closing(connect(path)) as database:
+        settings = dict(database.execute(
+            "SELECT setting_key,setting_value FROM dashboard_settings WHERE setting_key LIKE 'control_%'"
+        ))
+    return {
+        "start_date": settings.get("control_start_date", ""),
+        "end_date": settings.get("control_end_date", ""),
+        "budget_credits": float(settings["control_budget_credits"]) if settings.get("control_budget_credits") else None,
+        "machine_slots": int(settings.get("control_machine_slots", "6")),
+        "hard_cap": settings.get("control_hard_cap", "false") == "true",
+    }
+
+
+def set_control_settings(
+    path: Path, *, start_date: str, end_date: str, budget: float | None,
+    machine_slots: int, hard_cap: bool,
+) -> None:
+    start = _date_value(start_date)
+    end = _date_value(end_date)
+    if start > end:
+        raise ValueError("start after end")
+    if (end - start).days > 366:
+        raise ValueError("period too long")
+    if budget is not None and not 0.000001 <= budget <= 10_000_000_000:
+        raise ValueError("invalid budget")
+    if not 1 <= machine_slots <= 100:
+        raise ValueError("invalid machine slots")
+    if hard_cap and budget is None:
+        raise ValueError("hard cap requires explicit budget")
+    values = {
+        "control_start_date": start.isoformat(),
+        "control_end_date": end.isoformat(),
+        "control_budget_credits": "" if budget is None else str(budget),
+        "control_machine_slots": str(machine_slots),
+        "control_hard_cap": "true" if hard_cap else "false",
+    }
+    with closing(connect(path)) as database, database:
+        for key, value in values.items():
+            database.execute(
+                "INSERT INTO dashboard_settings(setting_key,setting_value) VALUES (?,?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                (key, value),
+            )
+
+
+def summary(
+    path: Path, days: int = 30, start_date: str | None = None, end_date: str | None = None,
+) -> dict[str, object]:
+    since, until, resolved_start, resolved_end = _time_bounds(days, start_date, end_date)
+    current_quota = latest_quota(path)
+    if (
+        start_date and end_date and current_quota
+        and current_quota["period_start"] == resolved_start
+        and current_quota["period_end"] == resolved_end
+    ):
+        since = str(current_quota["period_start_at"])
+        until = str(current_quota["period_end_at"])
     with closing(connect(path)) as database, database:
         rows = database.execute(
             """SELECT machine_id,machine_name,model,model_level,service_tier,COUNT(*),SUM(input_tokens),
                       SUM(cached_input_tokens),SUM(output_tokens),
                       SUM(reasoning_output_tokens),SUM(total_tokens),MAX(occurred_at)
-                 FROM usage_events WHERE occurred_at >= ?
+                 FROM usage_events WHERE occurred_at >= ? AND occurred_at < ?
                  GROUP BY machine_id,machine_name,model,model_level,service_tier""",
-            (since,),
+            (since, until),
         ).fetchall()
         daily_rows = database.execute(
             """SELECT date(occurred_at,'+8 hours'),machine_id,machine_name,model,model_level,
                       service_tier,COUNT(*),SUM(input_tokens),SUM(cached_input_tokens),
                       SUM(output_tokens),SUM(reasoning_output_tokens),SUM(total_tokens)
-                 FROM usage_events WHERE occurred_at >= ?
+                 FROM usage_events WHERE occurred_at >= ? AND occurred_at < ?
                  GROUP BY date(occurred_at,'+8 hours'),machine_id,machine_name,model,model_level,service_tier
                  ORDER BY 1""",
-            (since,),
+            (since, until),
         ).fetchall()
         configured_rates = {
             _model_key(row[0]): (float(row[1]), float(row[2]), float(row[3]))
@@ -419,8 +597,7 @@ def summary(path: Path, days: int) -> dict[str, object]:
             )
         }
         budget_row = database.execute(
-            "SELECT setting_value FROM dashboard_settings WHERE setting_key = ?",
-            (f"budget_{days}",),
+            "SELECT setting_value FROM dashboard_settings WHERE setting_key = ?", (f"budget_{days}",)
         ).fetchone()
     machine_map: dict[tuple[str, str], dict[str, object]] = {}
     model_map: dict[tuple[str, str, str], dict[str, object]] = {}
@@ -495,8 +672,29 @@ def summary(path: Path, days: int) -> dict[str, object]:
     models = sorted(model_map.values(), key=lambda item: item["estimated_credits"], reverse=True)
     average = round(sum(item["estimated_credits"] for item in machines) / len(machines), 6) if machines else 0.0
     highest = max((item["estimated_credits"] for item in machines), default=0.0)
-    budget = float(budget_row[0]) if budget_row is not None else None
-    target = round(budget / len(machines), 6) if budget is not None and machines else None
+    control = _control_settings(path)
+    quota = current_quota
+    control_matches = (
+        control["start_date"] == resolved_start and control["end_date"] == resolved_end
+    )
+    budget = (
+        control["budget_credits"] if control_matches
+        else float(budget_row[0]) if budget_row is not None else None
+    )
+    slots = int(
+        control["machine_slots"] if control_matches
+        else max(len(machines), 1) if budget_row is not None
+        else 6
+    )
+    tracked_credits = round(sum(item["estimated_credits"] for item in machines), 6)
+    quota_matches = bool(
+        quota and quota["period_start"] == resolved_start and quota["period_end"] == resolved_end
+    )
+    inferred_budget = None
+    if quota_matches and quota and 0 < float(quota["used_percent"]) <= 100:
+        inferred_budget = round(tracked_credits / (float(quota["used_percent"]) / 100), 6)
+    allocation_budget = budget if budget is not None else inferred_budget
+    target = round(allocation_budget / slots, 6) if allocation_budget is not None else None
     for machine in machines:
         machine["deviation_percent"] = (
             round((machine["estimated_credits"] / average - 1) * 100, 1) if average else 0.0
@@ -504,6 +702,11 @@ def summary(path: Path, days: int) -> dict[str, object]:
         machine["catch_up_to_highest"] = round(highest - machine["estimated_credits"], 6)
         machine["budget_remaining"] = (
             round(max(target - machine["estimated_credits"], 0), 6) if target is not None else None
+        )
+        machine["allocation_status"] = (
+            "limit" if target is not None and machine["estimated_credits"] >= target
+            else "reduce" if target is not None and machine["estimated_credits"] >= target * 0.9
+            else "available" if target is not None else "unconfigured"
         )
     daily_map: dict[str, dict[str, object]] = {}
     for row in daily_rows:
@@ -550,12 +753,20 @@ def summary(path: Path, days: int) -> dict[str, object]:
     daily.sort(key=lambda item: item["date"])
     return {
         "days": days,
+        "start_date": resolved_start,
+        "end_date": resolved_end,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "machines": machines,
         "models": models,
         "budget_credits": budget,
+        "allocation_budget_credits": allocation_budget,
+        "inferred_budget_credits": inferred_budget,
+        "machine_slots": slots,
+        "hard_cap_enabled": bool(control["hard_cap"] and control_matches and budget is not None),
         "per_machine_target": target,
         "average_estimated_credits": average,
+        "quota": quota,
+        "control": control,
         "daily": daily,
         "totals": {
             "machines": len(machines),
@@ -565,7 +776,7 @@ def summary(path: Path, days: int) -> dict[str, object]:
             "output_tokens": sum(item["output_tokens"] for item in machines),
             "reasoning_output_tokens": sum(item["reasoning_output_tokens"] for item in machines),
             "total_tokens": sum(item["total_tokens"] for item in machines),
-            "estimated_credits": round(sum(item["estimated_credits"] for item in machines), 6),
+            "estimated_credits": tracked_credits,
             "unrated_tokens": sum(item["unrated_tokens"] for item in machines),
         },
     }
@@ -665,6 +876,82 @@ def _query_days(query: str) -> int:
         return 30
 
 
+def _date_value(value: str):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise ValueError("invalid date") from None
+
+
+def _time_bounds(
+    days: int, start_date: str | None, end_date: str | None,
+) -> tuple[str, str, str, str]:
+    if start_date and end_date:
+        start = _date_value(start_date)
+        end = _date_value(end_date)
+        if start > end or (end - start).days > 366:
+            raise ValueError("invalid date range")
+        start_local = datetime.combine(start, datetime.min.time(), BEIJING)
+        end_local = datetime.combine(end + timedelta(days=1), datetime.min.time(), BEIJING)
+    else:
+        end_local = datetime.now(BEIJING)
+        start_local = end_local - timedelta(days=min(max(days, 1), 366))
+        start = start_local.date()
+        end = end_local.date()
+    return (
+        start_local.astimezone(timezone.utc).isoformat(),
+        end_local.astimezone(timezone.utc).isoformat(),
+        start.isoformat(), end.isoformat(),
+    )
+
+
+def _query_scope(query: str, database: Path) -> tuple[int, str | None, str | None]:
+    values = parse_qs(query)
+    start = values.get("start", [""])[0]
+    end = values.get("end", [""])[0]
+    if start or end:
+        try:
+            start_date = _date_value(start).isoformat()
+            end_date = _date_value(end).isoformat()
+            if _date_value(start_date) > _date_value(end_date):
+                raise ValueError
+            return min((_date_value(end_date) - _date_value(start_date)).days + 1, 366), start_date, end_date
+        except ValueError:
+            pass
+    if "days" in values:
+        return _query_days(query), None, None
+    control = _control_settings(database)
+    if control["start_date"] and control["end_date"]:
+        return 30, str(control["start_date"]), str(control["end_date"])
+    quota = latest_quota(database)
+    if quota is not None:
+        return 30, str(quota["period_start"]), str(quota["period_end"])
+    return 30, None, None
+
+
+def machine_policy(path: Path, machine_id: str) -> dict[str, object]:
+    if not machine_id or len(machine_id) > 64:
+        raise ValueError("invalid machine id")
+    control = _control_settings(path)
+    if not control["start_date"] or not control["end_date"] or control["budget_credits"] is None:
+        return {"blocked": False, "reason": "hard_cap_not_configured"}
+    data = summary(
+        path, start_date=str(control["start_date"]), end_date=str(control["end_date"])
+    )
+    machine = next((item for item in data["machines"] if item["machine_id"] == machine_id), None)
+    used = float(machine["estimated_credits"]) if machine else 0.0
+    target = float(data["per_machine_target"] or 0)
+    blocked = bool(control["hard_cap"] and target > 0 and used >= target)
+    return {
+        "blocked": blocked,
+        "reason": "machine_credit_limit_reached" if blocked else "within_machine_credit_limit",
+        "used_credits": round(used, 6), "limit_credits": round(target, 6),
+        "remaining_credits": round(max(target - used, 0), 6),
+        "period_start": control["start_date"], "period_end": control["end_date"],
+        "hard_cap_enabled": bool(control["hard_cap"]),
+    }
+
+
 def login_page(*, error: bool = False) -> str:
     warning = '<p class="error">账号或密码不正确</p>' if error else ""
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -682,31 +969,31 @@ def dashboard_page(
 ) -> str:
     content = {
         "overview": lambda: _overview_page(data, days),
-        "daily": lambda: _daily_page(data),
         "machines": lambda: _machines_page(data, days),
         "models": lambda: _models_page(data),
         "machine": lambda: _machine_page(data, machine_id),
         "settings": lambda: _settings_page(data, session, role, days, secret),
     }[page]()
     page_names = {
-        "overview": "总览", "daily": "每日统计", "machines": "机器", "models": "模型",
+        "overview": "总览", "machines": "机器", "models": "模型",
         "machine": "机器详情", "settings": "设置",
     }
     primary = [
         ("overview", "/dashboard", "总览"),
-        ("daily", "/dashboard/daily", "每日"),
         ("machines", "/dashboard/machines", "机器"),
         ("models", "/dashboard/models", "模型"),
         ("settings", "/dashboard/settings", "设置"),
     ]
+    scope = urlencode({"start": data["start_date"], "end": data["end_date"]})
     nav = "".join(
         f'<a class="{"active" if page == key or (page == "machine" and key == "machines") else ""}" '
-        f'href="{url}?days={days}">{label}</a>' for key, url, label in primary
+        f'href="{url}?{scope}">{label}</a>' for key, url, label in primary
     )
-    ranges = "".join(
-        f'<a class="{"active" if days == choice else ""}" href="{_page_url(page, choice, machine_id)}">{choice} 天</a>'
-        for choice in (7, 30, 90, 180, 366)
-    )
+    filter_path = _page_url(page, days, machine_id).split("?", 1)[0]
+    hidden_machine = f'<input type="hidden" name="id" value="{html.escape(machine_id, quote=True)}">' if machine_id else ""
+    date_filter = f'''<form class="date-filter" method="get" action="{filter_path}">{hidden_machine}
+<label>开始<input type="date" name="start" value="{html.escape(data['start_date'])}" required></label>
+<label>结束<input type="date" name="end" value="{html.escape(data['end_date'])}" required></label><button>统计</button></form>'''
     role_label = "管理员" if role == "admin" else "只读"
     total = data["totals"]
     warning = (
@@ -715,44 +1002,111 @@ def dashboard_page(
     )
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{page_names[page]} · Codex 用量中心</title><style>{_CSS}</style></head>
-<body><header><div><h1>Codex 用量中心</h1><p>{days} 天 · 更新于 {html.escape(_short_time(data['generated_at']))}</p></div>
+<body><header><div><h1>Codex 用量中心</h1><p>{html.escape(data['start_date'])} 至 {html.escape(data['end_date'])} · 更新于 {html.escape(_short_time(data['generated_at']))}</p></div>
 <div class="identity"><span>{role_label}</span><a href="/logout">退出</a></div></header>
-<main><nav class="primary">{nav}</nav><nav class="ranges">{ranges}</nav>{warning}{content}
-<p class="foot">Credits 由模型响应中的 usage、官方标准费率和 Fast 倍率估算；账号剩余额度与重置时间仍以 OpenAI Usage 页面为准。</p></main></body></html>"""
+<main><div class="toolbar"><nav class="primary">{nav}</nav>{date_filter}</div>{warning}{content}
+<p class="foot">Credits 由模型响应中的 usage、官方标准费率和 Fast 倍率估算；官方剩余额度来自 Codex 自身 Usage 接口的脱敏快照。</p></main></body></html>"""
 
 
 def _overview_page(data: dict[str, object], days: int) -> str:
-    total, machines, models, daily = data["totals"], data["machines"], data["models"], data["daily"]
-    cards = _cards(total)
-    max_credits = max((item["estimated_credits"] for item in machines), default=1) or 1
+    quota = data.get("quota")
+    if quota:
+        stale = " · 数据超过 20 分钟未更新" if quota["stale"] else ""
+        inferred = (
+            f' · 推算总额度 {_credits(data["inferred_budget_credits"])} Credits'
+            if data["inferred_budget_credits"] is not None else ""
+        )
+        quota_html = f'''<section class="quota-strip"><div><span>官方当前窗口</span><strong>已用 {quota['used_percent']:g}% · 剩余 {quota['remaining_percent']:g}%</strong></div>
+<div><span>重置时间</span><strong>{html.escape(_short_time(quota['reset_at']))}</strong></div><p>{html.escape(quota['plan_type'])}{inferred}{stale}</p></section>'''
+    else:
+        quota_html = '<section class="quota-strip muted"><div><strong>等待任一 Bridge 同步官方 Usage 快照</strong></div></section>'
+    line_chart = _machine_line_chart(data)
+    total_chart = _machine_total_chart(data)
+    return f"""{quota_html}<section class="dashboard-grid"><article class="panel chart-panel"><div class="panel-head"><div><h2>每日 Credits</h2><p>每条曲线代表一台设备</p></div></div>{line_chart}</article>
+<article class="panel total-panel"><div class="panel-head"><div><h2>统计期设备总额</h2><p>总计 {_credits(data['totals']['estimated_credits'])} Credits</p></div></div>{total_chart}</article></section>"""
+
+
+def _machine_line_chart(data: dict[str, object]) -> str:
+    machines = data["machines"]
+    if not machines:
+        return '<div class="empty">尚无设备用量数据</div>'
+    start = _date_value(data["start_date"])
+    end = min(_date_value(data["end_date"]), datetime.now(BEIJING).date())
+    dates = []
+    cursor = start
+    while cursor <= end:
+        dates.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    if not dates:
+        dates = [start.isoformat()]
+    daily_lookup: dict[tuple[str, str], float] = {}
+    for day in data["daily"]:
+        for machine in day["machines"]:
+            daily_lookup[(day["date"], machine["machine_id"])] = float(machine["estimated_credits"])
+    series = {
+        machine["machine_id"]: [daily_lookup.get((date, machine["machine_id"]), 0.0) for date in dates]
+        for machine in machines
+    }
+    maximum = max((value for values in series.values() for value in values), default=0.0) or 1.0
+    left, top, width, height = 58.0, 20.0, 822.0, 242.0
+    x = lambda index: left + (width * index / max(len(dates) - 1, 1))
+    y = lambda value: top + height - (height * value / maximum)
+    colors = ("#2463eb", "#e45756", "#17a673", "#f59e0b", "#805ad5", "#0891b2", "#db2777", "#64748b")
+    grid = "".join(
+        f'<line x1="{left}" y1="{top + height * step / 4:.1f}" x2="{left + width}" y2="{top + height * step / 4:.1f}" class="gridline"/>'
+        for step in range(5)
+    )
+    y_labels = "".join(
+        f'<text x="48" y="{top + height * step / 4 + 4:.1f}" text-anchor="end">{maximum * (4-step) / 4:.2f}</text>'
+        for step in range(5)
+    )
+    label_indexes = sorted(set(round((len(dates) - 1) * step / min(4, max(len(dates) - 1, 1))) for step in range(min(5, len(dates)))))
+    x_labels = "".join(
+        f'<text x="{x(index):.1f}" y="286" text-anchor="middle">{html.escape(dates[index][5:])}</text>'
+        for index in label_indexes
+    )
+    lines = []
+    legends = []
+    for index, machine in enumerate(machines):
+        color = colors[index % len(colors)]
+        points = " ".join(f"{x(i):.1f},{y(value):.1f}" for i, value in enumerate(series[machine["machine_id"]]))
+        dots = ""
+        if len(dates) <= 31:
+            dots = "".join(
+                f'<circle cx="{x(i):.1f}" cy="{y(value):.1f}" r="3" fill="{color}"><title>{html.escape(machine["machine_name"])} {dates[i]}: {_credits(value)}</title></circle>'
+                for i, value in enumerate(series[machine["machine_id"]])
+            )
+        lines.append(f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>{dots}')
+        legends.append(f'<span><i style="background:{color}"></i>{html.escape(machine["machine_name"])}</span>')
+    return f'''<div class="line-chart"><svg viewBox="0 0 900 300" role="img" aria-label="各设备每日 Credits 折线图">{grid}{y_labels}{x_labels}{''.join(lines)}</svg>
+<div class="legend">{''.join(legends)}</div></div>'''
+
+
+def _machine_total_chart(data: dict[str, object]) -> str:
+    machines = data["machines"]
+    if not machines:
+        return '<div class="empty">尚无设备用量数据</div>'
+    maximum = max(float(item["estimated_credits"]) for item in machines) or 1.0
+    target = data.get("per_machine_target")
     rows = []
     for item in machines:
-        width = min(100, item["estimated_credits"] / max_credits * 100)
-        deviation = item["deviation_percent"]
-        css = "over" if deviation > 10 else "under" if deviation < -10 else "balanced"
-        link = "/dashboard/machine?" + urlencode({"id": item["machine_id"], "days": days})
-        rows.append(f"""<tr><td><a class="name" href="{link}">{html.escape(item['machine_name'])}</a><small>{html.escape(item['machine_id'][:8])}</small></td>
-<td>{_number(item['requests'])}</td><td><div class="bar"><i style="width:{width:.1f}%"></i></div>{_credits(item['estimated_credits'])}</td>
-<td class="{css}">{deviation:+.1f}%</td><td>{_credits(item['catch_up_to_highest'])}</td><td>{html.escape(_short_time(item['last_seen']))}</td></tr>""")
-    recent = daily[-14:]
-    chart_max = max((item["estimated_credits"] for item in recent), default=1) or 1
-    bars = "".join(
-        f'<div class="daybar"><span>{_credits(item["estimated_credits"])}</span><i style="height:{max(3,item["estimated_credits"]/chart_max*100):.1f}%"></i><small>{html.escape(item["date"][5:])}</small></div>'
-        for item in recent
-    ) or '<p class="empty">尚无每日数据</p>'
-    top_models = "".join(
-        f'<li><span>{html.escape(item["model"])} · {html.escape(item["model_level"])} · {html.escape(_tier_label(item["service_tier"]))}</span><strong>{_credits(item["estimated_credits"])} C</strong></li>'
-        for item in models[:6]
-    ) or '<li class="empty">尚无模型数据</li>'
-    target = (
-        f'预算目标：每台 {_credits(data["per_machine_target"])} Credits'
-        if data["per_machine_target"] is not None else '按当前最高消耗计算追平建议'
+        width = max(1.0, float(item["estimated_credits"]) / maximum * 100)
+        if target is None:
+            advice = "尚未取得额度标准"
+            css = "neutral"
+        elif item["allocation_status"] == "limit":
+            advice, css = "已到均分上限", "limit"
+        elif item["allocation_status"] == "reduce":
+            advice, css = "接近上限，建议少用", "reduce"
+        else:
+            advice, css = f'还可使用 {_credits(item["budget_remaining"])}', "available"
+        rows.append(f'''<div class="total-row"><div><strong>{html.escape(item['machine_name'])}</strong><span class="advice {css}">{advice}</span></div>
+<div class="total-bar"><i style="width:{width:.1f}%"></i></div><b>{_credits(item['estimated_credits'])}</b></div>''')
+    target_note = (
+        f'<p class="target-note">{data["machine_slots"]} 等分目标：每台 {_credits(target)} Credits</p>'
+        if target is not None else '<p class="target-note">等待官方使用比例或管理员预算后生成均衡建议</p>'
     )
-    return f"""{cards}<section class="split"><article class="panel"><div class="panel-head"><div><h2>最近每日消耗</h2><p>最近 14 个有记录的日期</p></div></div><div class="chart">{bars}</div></article>
-<article class="panel"><div class="panel-head"><div><h2>主要模型组合</h2><p>模型、推理档位与速度档位</p></div></div><ul class="rank">{top_models}</ul></article></section>
-<section class="panel"><div class="panel-head"><div><h2>机器额度平衡</h2><p>{target}</p></div></div>
-<div class="table-wrap"><table><thead><tr><th>机器</th><th>请求</th><th>估算 Credits</th><th>偏离平均</th><th>追平还可用</th><th>最后使用</th></tr></thead>
-<tbody>{''.join(rows) or '<tr><td colspan="6" class="empty">尚无用量数据</td></tr>'}</tbody></table></div></section>"""
+    return f'<div class="total-chart">{"".join(rows)}{target_note}</div>'
 
 
 def _daily_page(data: dict[str, object]) -> str:
@@ -773,7 +1127,7 @@ def _daily_page(data: dict[str, object]) -> str:
 def _machines_page(data: dict[str, object], days: int) -> str:
     rows = []
     for item in data["machines"]:
-        link = "/dashboard/machine?" + urlencode({"id": item["machine_id"], "days": days})
+        link = "/dashboard/machine?" + urlencode({"id": item["machine_id"], "start": data["start_date"], "end": data["end_date"]})
         top_names = list(dict.fromkeys(model["model"] for model in item["models"]))[:3]
         top = "、".join(html.escape(model) for model in top_names)
         rows.append(f"""<tr><td><a class="name" href="{link}">{html.escape(item['machine_name'])}</a><small>{html.escape(item['machine_id'])}</small></td>
@@ -818,7 +1172,8 @@ def _machine_page(data: dict[str, object], machine_id: str) -> str:
         "machines": 1, "requests": machine["requests"], "total_tokens": machine["total_tokens"],
         "estimated_credits": machine["estimated_credits"],
     }
-    return f"""<div class="back"><a href="/dashboard/machines?days={data['days']}">← 返回机器列表</a></div><div class="title-row"><div><h2>{html.escape(machine['machine_name'])}</h2><p>{html.escape(machine['machine_id'])} · 最后使用 {html.escape(_short_time(machine['last_seen']))}</p></div></div>
+    back_query = urlencode({"start": data["start_date"], "end": data["end_date"]})
+    return f"""<div class="back"><a href="/dashboard/machines?{back_query}">← 返回机器列表</a></div><div class="title-row"><div><h2>{html.escape(machine['machine_name'])}</h2><p>{html.escape(machine['machine_id'])} · 最后使用 {html.escape(_short_time(machine['last_seen']))}</p></div></div>
 {_cards(local_totals)}<section class="split"><article class="panel"><div class="panel-head"><div><h2>模型组合</h2><p>缓存率 {machine['cache_hit_rate']:.1f}%</p></div></div><div class="table-wrap"><table><thead><tr><th>模型</th><th>推理</th><th>速度</th><th>请求</th><th>输入</th><th>缓存</th><th>输出</th><th>Credits</th></tr></thead><tbody>{model_rows}</tbody></table></div></article>
 <article class="panel"><div class="panel-head"><div><h2>每日历史</h2><p>仅显示有使用记录的日期</p></div></div><div class="table-wrap"><table><thead><tr><th>日期</th><th>请求</th><th>Token</th><th>Credits</th></tr></thead><tbody>{''.join(daily_rows)}</tbody></table></div></article></section>"""
 
@@ -827,7 +1182,11 @@ def _settings_page(data: dict[str, object], session: str, role: str, days: int, 
     if role != "admin":
         return '<section class="panel"><div class="panel-head"><div><h2>只读账号</h2><p>你可以查看全部统计，但修改预算和费率需要管理员账号。</p></div></div></section>'
     csrf = csrf_token(secret, session)
-    budget = "" if data["budget_credits"] is None else str(data["budget_credits"])
+    control = data["control"]
+    budget = "" if control["budget_credits"] is None else str(control["budget_credits"])
+    hard_checked = " checked" if control["hard_cap"] else ""
+    control_start = control["start_date"] or data["start_date"]
+    control_end = control["end_date"] or data["end_date"]
     rows = []
     seen = set()
     for item in data["models"]:
@@ -843,9 +1202,14 @@ def _settings_page(data: dict[str, object], session: str, role: str, days: int, 
 <label>输入<input type="number" name="input_rate" min="0" max="100000" step="0.001" value="{rates[0]}"></label>
 <label>缓存<input type="number" name="cached_rate" min="0" max="100000" step="0.001" value="{rates[1]}"></label>
 <label>输出<input type="number" name="output_rate" min="0" max="100000" step="0.001" value="{rates[2]}"></label><button>保存</button></form></td></tr>""")
-    return f"""<section class="panel"><div class="panel-head"><div><h2>周期预算</h2><p>预算只用于六台机器之间的公平建议，不会修改 OpenAI 账号额度。</p></div>
-<form class="budget" method="post" action="/dashboard/budget"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="days" value="{days}">
-<input type="number" name="budget" min="0.000001" step="0.01" placeholder="本周期 Credits 预算（可留空）" value="{budget}"><button>保存预算</button></form></div></section>
+    return f"""<section class="panel"><div class="panel-head"><div><h2>统计周期与六等分控制</h2><p>明确设置起止日期和总 Credits 后，可选择在单机达到均分上限时阻止其后续 Codex 模型请求。</p></div></div>
+<form class="control-form" method="post" action="/dashboard/control"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="days" value="{days}">
+<label>开始日期<input type="date" name="start_date" value="{html.escape(str(control_start))}" required></label>
+<label>结束日期<input type="date" name="end_date" value="{html.escape(str(control_end))}" required></label>
+<label>周期总 Credits<input type="number" name="budget" min="0.000001" step="0.01" placeholder="例如 1200" value="{budget}"></label>
+<label>均分设备数<input type="number" name="machine_slots" min="1" max="100" step="1" value="{control['machine_slots']}" required></label>
+<label class="check"><input type="checkbox" name="hard_cap"{hard_checked}> 达到均分上限后自动禁用该机模型请求</label><button>保存控制设置</button></form>
+<p class="safety-note">硬上限必须有明确预算才可开启；中央服务不可达时客户端沿用最近策略，不会因网络故障误停。</p></section>
 <section class="panel"><div class="panel-head"><div><h2>标准模型费率</h2><p>单位：每 100 万 Token 的 Credits。Fast 倍数由系统在标准费率之外自动应用。</p></div></div>
 <div class="table-wrap"><table><thead><tr><th>模型</th><th>输入 / 缓存 / 输出</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="2" class="empty">收到模型数据后可修改费率</td></tr>'}</tbody></table></div></section>"""
 
@@ -892,15 +1256,15 @@ def _short_time(value: object) -> str:
 _CSS = """
 :root{color-scheme:light;font-family:Inter,'Microsoft YaHei',sans-serif;background:#f3f6fb;color:#14213d}*{box-sizing:border-box}
 body{margin:0}h1,h2,p{margin:0}a{color:#245dc1}header{display:flex;justify-content:space-between;align-items:center;padding:22px max(4vw,24px);background:linear-gradient(120deg,#102a56,#173f79);color:white}header p{opacity:.72;margin-top:5px}.identity{display:flex;align-items:center;gap:14px}.identity span{padding:5px 10px;border:1px solid #ffffff42;border-radius:20px;font-size:12px}.identity a{color:white}
-main{max-width:1440px;margin:auto;padding:22px}.primary,.ranges{display:flex;gap:8px;overflow:auto}.primary{margin-bottom:12px}.ranges{margin-bottom:18px}.primary a,.ranges a{padding:9px 15px;border-radius:10px;color:#52647b;text-decoration:none;background:white;border:1px solid #e2e8f2;white-space:nowrap}.primary a.active{background:#173f79;color:white;border-color:#173f79}.ranges a{padding:6px 12px;border-radius:18px;font-size:13px}.ranges a.active{background:#2d6cdf;color:white;border-color:#2d6cdf}
+main{max-width:1440px;margin:auto;padding:22px}.toolbar{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:18px}.primary{display:flex;gap:8px;overflow:auto}.primary a{padding:9px 15px;border-radius:10px;color:#52647b;text-decoration:none;background:white;border:1px solid #e2e8f2;white-space:nowrap}.primary a.active{background:#173f79;color:white;border-color:#173f79}.date-filter{display:flex;align-items:end;gap:8px}.date-filter label{font-size:11px;color:#718096}.date-filter input{display:block;padding:7px;margin-top:3px}
 .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.cards article,.panel{background:white;border:1px solid #e0e7f1;border-radius:14px;box-shadow:0 5px 22px #19345d0b}.cards article{padding:18px}.cards span{display:block;color:#718096}.cards strong{display:block;font-size:27px;margin-top:7px}.panel{margin-top:18px;overflow:hidden}.split{display:grid;grid-template-columns:1.35fr 1fr;gap:18px}.split .panel{min-width:0}.panel-head{display:flex;justify-content:space-between;gap:18px;align-items:center;padding:20px}.panel-head p,.title-row p{color:#718096;margin-top:5px}.title-row{padding:8px 2px 2px}.title-row h2{font-size:26px}.back{margin:2px 0 14px}.back a{text-decoration:none}
 .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap}th,td{text-align:left;padding:13px 15px;border-top:1px solid #edf1f7}th{font-size:12px;color:#718096;background:#fafcff}td small{display:block;color:#98a5b7;margin-top:3px}.name{font-weight:700;text-decoration:none}.mix{white-space:normal;min-width:180px;color:#52647b;font-size:13px}
 .bar{display:inline-block;width:90px;height:7px;background:#e8eef8;border-radius:6px;margin-right:9px;vertical-align:middle}.bar i{display:block;height:100%;background:#2d6cdf;border-radius:6px}.over{color:#c53030}.under{color:#2b6cb0}.balanced{color:#218358}.notice{background:#fff8e6;border:1px solid #f4d48c;color:#7c5700;padding:11px 14px;border-radius:10px;margin-bottom:15px}
-.chart{height:230px;display:flex;align-items:flex-end;gap:8px;padding:20px;overflow:auto}.daybar{height:190px;min-width:38px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end}.daybar span{font-size:10px;color:#718096}.daybar i{width:24px;background:linear-gradient(#4b82ed,#245dc1);border-radius:6px 6px 2px 2px;margin:5px 0}.daybar small{font-size:10px;color:#718096}.rank{list-style:none;margin:0;padding:0 20px 18px}.rank li{display:flex;justify-content:space-between;gap:15px;padding:12px 0;border-top:1px solid #edf1f7}.rank span{color:#52647b}
+.dashboard-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:18px}.chart-panel,.total-panel{margin-top:0}.line-chart{padding:0 18px 18px}.line-chart svg{display:block;width:100%;height:auto;min-height:260px}.line-chart text{font-size:11px;fill:#718096}.gridline{stroke:#e6edf7;stroke-width:1}.legend{display:flex;flex-wrap:wrap;gap:10px 18px;justify-content:center}.legend span{font-size:12px;color:#52647b}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.quota-strip{display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:28px;background:#eaf2ff;border:1px solid #c9dcff;border-radius:14px;padding:14px 18px;margin-bottom:18px}.quota-strip span{display:block;font-size:11px;color:#64748b}.quota-strip strong{display:block;margin-top:3px}.quota-strip p{text-align:right;color:#52647b;font-size:12px}.quota-strip.muted{display:block;color:#718096}.total-chart{padding:0 20px 18px}.total-row{display:grid;grid-template-columns:minmax(120px,1.25fr) minmax(70px,1fr) auto;align-items:center;gap:10px;padding:11px 0;border-top:1px solid #edf1f7}.total-row strong{display:block;font-size:13px}.total-row b{font-size:13px}.total-bar{height:8px;background:#e8eef8;border-radius:8px}.total-bar i{display:block;height:100%;background:linear-gradient(90deg,#2463eb,#5b8def);border-radius:8px}.advice{display:block;font-size:10px;margin-top:3px}.advice.limit{color:#c53030}.advice.reduce{color:#b7791f}.advice.available{color:#218358}.advice.neutral{color:#718096}.target-note{font-size:12px;color:#52647b;background:#f7f9fc;padding:10px;border-radius:8px;margin-top:8px}.control-form{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:12px;padding:0 20px 18px;align-items:end}.control-form label{font-size:11px;color:#718096}.control-form input{display:block;width:100%;margin-top:4px}.control-form .check{grid-column:1/4;display:flex;align-items:center;gap:8px;font-size:13px;color:#52647b}.control-form .check input{width:auto;margin:0}.safety-note{margin:0 20px 20px;color:#8a5b00;background:#fff8e6;padding:10px;border-radius:8px;font-size:12px}
 button{border:0;border-radius:8px;background:#2463eb;color:white;padding:9px 14px;font-weight:600;cursor:pointer}input{border:1px solid #ccd6e5;border-radius:8px;padding:9px;background:white}.inline,.budget{display:flex;gap:7px}.rates label{font-size:11px;color:#718096}.rates input{display:block;width:78px;padding:6px}.budget input{width:250px}.empty{text-align:center;color:#718096;padding:32px}.foot{text-align:center;color:#718096;padding:26px;font-size:13px}
 .login-body{min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#edf4ff,#f8fbff)}.login-card{width:min(390px,92vw);padding:30px;background:white;border-radius:18px;box-shadow:0 18px 60px #18375d22}.login-card .muted{color:#718096;margin:8px 0 22px}.login-card label{display:block;margin:14px 0;color:#52647b}.login-card input{display:block;width:100%;margin-top:6px}.login-card button{width:100%;margin-top:8px}.error{color:#c53030;background:#fff5f5;padding:10px;border-radius:8px}
-@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}.panel-head{align-items:flex-start;flex-direction:column}.budget{width:100%}.budget input{flex:1}main{padding:14px}.chart{height:205px}.daybar{height:165px}}
-@media(max-width:520px){header{align-items:flex-start;flex-direction:column;padding:18px 24px}.identity{justify-content:flex-end;margin-top:12px;width:100%}}
+@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.split,.dashboard-grid{grid-template-columns:1fr}.panel-head{align-items:flex-start;flex-direction:column}.budget{width:100%}.budget input{flex:1}main{padding:14px}.toolbar{align-items:flex-start;flex-direction:column}.date-filter{width:100%;overflow:auto}.quota-strip{grid-template-columns:1fr 1fr}.quota-strip p{grid-column:1/3;text-align:left}.control-form{grid-template-columns:repeat(2,1fr)}.control-form .check{grid-column:1/3}}
+@media(max-width:520px){header{align-items:flex-start;flex-direction:column;padding:18px 24px}.identity{justify-content:flex-end;margin-top:12px;width:100%}.date-filter label{min-width:130px}.quota-strip{grid-template-columns:1fr}.quota-strip p{grid-column:auto}.control-form{grid-template-columns:1fr}.control-form .check{grid-column:auto}.line-chart{overflow:auto}.line-chart svg{min-width:620px}.total-row{grid-template-columns:1fr auto}.total-bar{grid-column:1/3}}
 """
 
 

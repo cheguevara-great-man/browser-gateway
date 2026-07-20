@@ -4,6 +4,7 @@ import importlib.util
 import http.client
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,11 +67,48 @@ class CollectorTests(unittest.TestCase):
             self.assertIn("future-model", page)
             self.assertIn("估算 Credits", page)
             self.assertNotIn("prompt", page)
-            for page_name in ("overview", "daily", "machines", "models", "settings"):
+            for page_name in ("overview", "machines", "models", "settings"):
                 rendered = MODULE.dashboard_page(
                     result, "session", "admin", 30, b"secret", page=page_name
                 )
                 self.assertIn("Codex 用量中心", rendered)
+
+    def test_quota_snapshot_infers_pool_and_custom_period_policy_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "usage.sqlite3"
+            MODULE.initialize(database)
+            MODULE.insert_events(database, [self.event()])
+            now = int(time.time())
+            quota = {
+                "machine_id": "machine-1",
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "plan_type": "pro",
+                "used_percent": 20,
+                "allowed": True,
+                "limit_reached": False,
+                "limit_window_seconds": 604800,
+                "reset_at": now + 3 * 86400,
+            }
+            latest = MODULE.insert_quota_snapshot(database, quota)
+            result = MODULE.summary(
+                database, start_date=latest["period_start"], end_date=latest["period_end"]
+            )
+            self.assertEqual(result["quota"]["remaining_percent"], 80)
+            self.assertAlmostEqual(
+                result["inferred_budget_credits"], result["totals"]["estimated_credits"] / 0.2,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                result["per_machine_target"], result["inferred_budget_credits"] / 6, places=6
+            )
+            today = datetime.now(MODULE.BEIJING).date().isoformat()
+            MODULE.set_control_settings(
+                database, start_date=today, end_date=today, budget=0.001,
+                machine_slots=6, hard_cap=True,
+            )
+            policy = MODULE.machine_policy(database, "machine-1")
+            self.assertTrue(policy["blocked"])
+            self.assertEqual(policy["reason"], "machine_credit_limit_reached")
 
     def test_signed_dashboard_session_expires_and_rejects_tampering(self) -> None:
         token = MODULE.create_session(b"secret", role="admin", now=1_000)
@@ -145,13 +183,18 @@ class CollectorTests(unittest.TestCase):
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
                 page = response.read().decode("utf-8")
-                self.assertIn("机器额度平衡", page)
-                self.assertIn("主要模型组合", page)
+                self.assertIn("每日 Credits", page)
+                self.assertIn("统计期设备总额", page)
 
                 connection.request("GET", "/dashboard/daily?days=30", headers={"Cookie": cookie})
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
-                self.assertIn("每日明细", response.read().decode("utf-8"))
+                self.assertIn("每日 Credits", response.read().decode("utf-8"))
+
+                connection.request("GET", "/v1/usage/summary?days=30", headers={"Cookie": cookie})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertIn("daily", response.read().decode("utf-8"))
 
                 session_token = cookie.split("=", 1)[1]
                 body = (

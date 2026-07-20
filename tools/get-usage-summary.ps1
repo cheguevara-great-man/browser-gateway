@@ -2,6 +2,8 @@
 param(
     [ValidateRange(1, 366)]
     [int]$Days = 30,
+    [string]$StartDate,
+    [string]$EndDate,
     [string]$CredentialPath = (Join-Path $HOME '.browser-gateway\usage-admin.local.json')
 )
 
@@ -10,7 +12,17 @@ if (-not (Test-Path -LiteralPath $CredentialPath -PathType Leaf)) {
     throw "Usage administrator credential file not found: $CredentialPath"
 }
 $credential = Get-Content -LiteralPath $CredentialPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$uri = "$($credential.summaryUrl)?days=$Days"
+if ([bool]$StartDate -xor [bool]$EndDate) {
+    throw 'StartDate and EndDate must be supplied together.'
+}
+if ($StartDate) {
+    $start = [datetime]::ParseExact($StartDate, 'yyyy-MM-dd', $null).ToString('yyyy-MM-dd')
+    $end = [datetime]::ParseExact($EndDate, 'yyyy-MM-dd', $null).ToString('yyyy-MM-dd')
+    if ([datetime]$start -gt [datetime]$end) { throw 'StartDate must not be after EndDate.' }
+    $uri = "$($credential.summaryUrl)?start=$start&end=$end"
+} else {
+    $uri = "$($credential.summaryUrl)?days=$Days"
+}
 $headers = @{ Authorization = "Bearer $($credential.adminToken)" }
 $summary = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
 
