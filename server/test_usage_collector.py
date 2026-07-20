@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -120,6 +120,37 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(policy["reason"], "machine_credit_limit_reached")
             self.assertEqual(policy["mode"], "manual")
 
+    def test_official_window_uses_exact_times_not_midnight_dates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "usage.sqlite3"
+            MODULE.initialize(database)
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            reset = datetime(2026, 7, 25, 4, 30, tzinfo=timezone.utc)
+            exact_start = reset - timedelta(days=7)
+            outside = self.event("outside-window")
+            outside["occurred_at"] = (exact_start - timedelta(hours=1)).isoformat()
+            inside = self.event("inside-window")
+            inside["occurred_at"] = (exact_start + timedelta(hours=1)).isoformat()
+            MODULE.insert_events(database, [outside, inside])
+            quota = MODULE.insert_quota_snapshot(database, {
+                "machine_id": "machine-1", "observed_at": now.isoformat(), "plan_type": "pro",
+                "used_percent": 10, "allowed": True, "limit_reached": False,
+                "limit_window_seconds": 7 * 86400, "reset_at": int(reset.timestamp()),
+            })
+            # Both events fall on the same Beijing calendar date, but only one is inside
+            # the exact rolling window. Date-only filtering would incorrectly count both.
+            self.assertEqual(
+                (exact_start - timedelta(hours=1)).astimezone(MODULE.BEIJING).date(),
+                (exact_start + timedelta(hours=1)).astimezone(MODULE.BEIJING).date(),
+            )
+            result = MODULE.summary(
+                database, start_date=quota["period_start"], end_date=quota["period_end"]
+            )
+            self.assertEqual(result["totals"]["requests"], 1)
+            self.assertEqual(
+                MODULE._short_time("2026-07-18T04:30:00+00:00"), "2026-07-18 12:30"
+            )
+
     def test_signed_dashboard_session_expires_and_rejects_tampering(self) -> None:
         token = MODULE.create_session(b"secret", role="admin", now=1_000)
         self.assertEqual(MODULE.validate_session(b"secret", token, now=1_100), "admin")
@@ -225,7 +256,7 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 page = response.read().decode("utf-8")
                 self.assertIn("每日 Credits", page)
-                self.assertIn("统计期设备总额", page)
+                self.assertIn("设备额度进度", page)
 
                 connection.request("GET", "/dashboard/daily?days=30", headers={"Cookie": cookie})
                 response = connection.getresponse()
