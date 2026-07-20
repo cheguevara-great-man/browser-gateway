@@ -1257,6 +1257,7 @@ def _settings_page(data: dict[str, object], session: str, role: str, days: int, 
     quota = data.get("quota")
     official_status = (
         f'当前官方窗口：{html.escape(quota["period_start"])} 至 {html.escape(quota["period_end"])}，已用 {quota["used_percent"]:g}%，剩余 {quota["remaining_percent"]:g}%。'
+        + (" 快照已过期，硬上限暂时放行。" if quota["stale"] else "")
         if quota else "尚未收到官方 Usage 快照；选择后会等待 Bridge 自动同步。"
     )
     rows = []
