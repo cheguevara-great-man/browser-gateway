@@ -27,6 +27,7 @@ class CollectorTests(unittest.TestCase):
             "route": "chatgpt-codex",
             "model": "gpt-5.3-codex",
             "model_level": "high",
+            "service_tier": "default",
             "input_tokens": 100,
             "cached_input_tokens": 50,
             "output_tokens": 20,
@@ -46,6 +47,7 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(result["machines"][0]["machine_name"], "PC-1")
             self.assertAlmostEqual(result["totals"]["estimated_credits"], 0.009406, places=6)
             self.assertEqual(result["models"][0]["model_level"], "high")
+            self.assertEqual(result["daily"][0]["estimated_credits"], result["totals"]["estimated_credits"])
 
     def test_custom_rate_budget_and_dashboard_fairness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -60,16 +62,35 @@ class CollectorTests(unittest.TestCase):
             result = MODULE.summary(database, 30)
             self.assertAlmostEqual(result["totals"]["estimated_credits"], 0.0155)
             self.assertEqual(result["per_machine_target"], 4.0)
-            page = MODULE.dashboard_page(result, "session", 30, b"secret")
+            page = MODULE.dashboard_page(result, "session", "admin", 30, b"secret", page="models")
             self.assertIn("future-model", page)
             self.assertIn("估算 Credits", page)
             self.assertNotIn("prompt", page)
+            for page_name in ("overview", "daily", "machines", "models", "settings"):
+                rendered = MODULE.dashboard_page(
+                    result, "session", "admin", 30, b"secret", page=page_name
+                )
+                self.assertIn("Codex 用量中心", rendered)
 
     def test_signed_dashboard_session_expires_and_rejects_tampering(self) -> None:
-        token = MODULE.create_session(b"secret", now=1_000)
-        self.assertTrue(MODULE.validate_session(b"secret", token, now=1_100))
-        self.assertFalse(MODULE.validate_session(b"secret", token + "x", now=1_100))
-        self.assertFalse(MODULE.validate_session(b"secret", token, now=50_000))
+        token = MODULE.create_session(b"secret", role="admin", now=1_000)
+        self.assertEqual(MODULE.validate_session(b"secret", token, now=1_100), "admin")
+        self.assertIsNone(MODULE.validate_session(b"secret", token + "x", now=1_100))
+        self.assertIsNone(MODULE.validate_session(b"secret", token, now=50_000))
+
+    def test_fast_mode_applies_official_model_multiplier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "usage.sqlite3"
+            MODULE.initialize(database)
+            standard = self.event("standard")
+            standard["model"] = "gpt-5.4"
+            fast = self.event("fast")
+            fast["model"] = "gpt-5.4"
+            fast["service_tier"] = "priority"
+            MODULE.insert_events(database, [standard, fast])
+            result = MODULE.summary(database, 30)
+            credits = {item["service_tier"]: item["estimated_credits"] for item in result["models"]}
+            self.assertAlmostEqual(credits["priority"], credits["default"] * 2, delta=0.000002)
 
     def test_rejects_impossible_totals_and_extra_fields(self) -> None:
         event = self.event()
@@ -87,6 +108,7 @@ class CollectorTests(unittest.TestCase):
             MODULE.initialize(database)
             event = self.event()
             del event["model_level"]
+            del event["service_tier"]
             self.assertEqual(MODULE.insert_events(database, [event]), 1)
             self.assertEqual(MODULE.summary(database, 30)["models"][0]["model_level"], "default")
 
@@ -96,7 +118,8 @@ class CollectorTests(unittest.TestCase):
                 ("127.0.0.1", 0), MODULE.Handler,
                 database=Path(directory) / "usage.sqlite3",
                 report_token="report", admin_token="admin",
-                dashboard_username="viewer", dashboard_password="correct horse",
+                dashboard_admin_username="admin", dashboard_admin_password="admin horse",
+                dashboard_viewer_username="viewer", dashboard_viewer_password="correct horse",
                 session_secret="session-secret",
             )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -123,7 +146,25 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 page = response.read().decode("utf-8")
                 self.assertIn("机器额度平衡", page)
-                self.assertIn("模型、档位与 Credits 费率", page)
+                self.assertIn("主要模型组合", page)
+
+                connection.request("GET", "/dashboard/daily?days=30", headers={"Cookie": cookie})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertIn("每日明细", response.read().decode("utf-8"))
+
+                session_token = cookie.split("=", 1)[1]
+                body = (
+                    "csrf=" + MODULE.csrf_token(b"session-secret", session_token)
+                    + "&days=30&budget=10"
+                )
+                connection.request(
+                    "POST", "/dashboard/budget", body,
+                    {"Content-Type": "application/x-www-form-urlencoded", "Cookie": cookie},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 403)
+                self.assertIn("administrator_required", response.read().decode("utf-8"))
             finally:
                 connection.close()
                 server.shutdown()

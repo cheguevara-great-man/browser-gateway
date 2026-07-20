@@ -19,6 +19,7 @@ USAGE_BACKEND_PORT="19443"
 USAGE_SOURCE="/root/browser-gateway-usage-collector.py"
 USAGE_CREDENTIALS="$CONFIG_ROOT/usage-credentials.json"
 USAGE_ADMIN_FILE="/root/browser-gateway-usage-admin.json"
+USAGE_VIEWER_FILE="/root/browser-gateway-usage-viewer.json"
 
 fail() { echo "browser-gateway: $*" >&2; exit 1; }
 
@@ -150,27 +151,37 @@ gateway_password="$(jq -er '.password' "$CREDENTIALS_FILE")"
 if [[ ! -s "$USAGE_CREDENTIALS" ]]; then
   report_token="$(openssl rand -hex 32)"
   admin_token="$(openssl rand -hex 32)"
-  dashboard_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+  dashboard_admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+  dashboard_viewer_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
   session_secret="$(openssl rand -hex 32)"
   jq -n --arg report_token "$report_token" --arg admin_token "$admin_token" \
-    --arg dashboard_password "$dashboard_password" --arg session_secret "$session_secret" \
-    '{report_token:$report_token,admin_token:$admin_token,dashboard_username:"admin",dashboard_password:$dashboard_password,session_secret:$session_secret}' > "$USAGE_CREDENTIALS.next"
+    --arg dashboard_admin_password "$dashboard_admin_password" \
+    --arg dashboard_viewer_password "$dashboard_viewer_password" --arg session_secret "$session_secret" \
+    '{report_token:$report_token,admin_token:$admin_token,dashboard_admin_username:"admin",dashboard_admin_password:$dashboard_admin_password,dashboard_viewer_username:"viewer",dashboard_viewer_password:$dashboard_viewer_password,session_secret:$session_secret}' > "$USAGE_CREDENTIALS.next"
   install -o root -g browser-gateway -m 0640 "$USAGE_CREDENTIALS.next" "$USAGE_CREDENTIALS"
   rm -f "$USAGE_CREDENTIALS.next"
 fi
-if [[ "$(jq -r '.dashboard_password // empty' "$USAGE_CREDENTIALS")" == "" ]]; then
-  dashboard_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+if ! jq -e '.dashboard_admin_password and .dashboard_viewer_password and .session_secret' "$USAGE_CREDENTIALS" >/dev/null; then
+  dashboard_admin_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
+  dashboard_viewer_password="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')"
   session_secret="$(openssl rand -hex 32)"
-  jq --arg dashboard_password "$dashboard_password" --arg session_secret "$session_secret" \
-    '.dashboard_username="admin" | .dashboard_password=$dashboard_password | .session_secret=$session_secret' \
+  jq --arg dashboard_admin_password "$dashboard_admin_password" \
+    --arg dashboard_viewer_password "$dashboard_viewer_password" --arg session_secret "$session_secret" \
+    '.dashboard_admin_username=(.dashboard_admin_username // .dashboard_username // "admin") |
+     .dashboard_admin_password=(.dashboard_admin_password // .dashboard_password // $dashboard_admin_password) |
+     .dashboard_viewer_username=(.dashboard_viewer_username // "viewer") |
+     .dashboard_viewer_password=(.dashboard_viewer_password // $dashboard_viewer_password) |
+     .session_secret=(.session_secret // $session_secret)' \
     "$USAGE_CREDENTIALS" > "$USAGE_CREDENTIALS.next"
   install -o root -g browser-gateway -m 0640 "$USAGE_CREDENTIALS.next" "$USAGE_CREDENTIALS"
   rm -f "$USAGE_CREDENTIALS.next"
 fi
 report_token="$(jq -er '.report_token' "$USAGE_CREDENTIALS")"
 admin_token="$(jq -er '.admin_token' "$USAGE_CREDENTIALS")"
-dashboard_username="$(jq -er '.dashboard_username' "$USAGE_CREDENTIALS")"
-dashboard_password="$(jq -er '.dashboard_password' "$USAGE_CREDENTIALS")"
+dashboard_admin_username="$(jq -er '.dashboard_admin_username' "$USAGE_CREDENTIALS")"
+dashboard_admin_password="$(jq -er '.dashboard_admin_password' "$USAGE_CREDENTIALS")"
+dashboard_viewer_username="$(jq -er '.dashboard_viewer_username' "$USAGE_CREDENTIALS")"
+dashboard_viewer_password="$(jq -er '.dashboard_viewer_password' "$USAGE_CREDENTIALS")"
 tmp_credentials="$work_root/client-credentials.json"
 jq --arg usage_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/events" \
    --arg report_token "$report_token" \
@@ -179,10 +190,14 @@ jq --arg usage_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/events" \
 install -o root -g root -m 0600 "$tmp_credentials" "$CREDENTIALS_FILE"
 jq -n --arg summary_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/summary" \
   --arg dashboard_url "https://${PUBLIC_IP}:${USAGE_PORT}/dashboard" \
-  --arg admin_token "$admin_token" --arg dashboard_username "$dashboard_username" \
-  --arg dashboard_password "$dashboard_password" \
-  '{summaryUrl:$summary_url,adminToken:$admin_token,dashboardUrl:$dashboard_url,dashboardUsername:$dashboard_username,dashboardPassword:$dashboard_password}' > "$USAGE_ADMIN_FILE"
+  --arg admin_token "$admin_token" --arg dashboard_username "$dashboard_admin_username" \
+  --arg dashboard_password "$dashboard_admin_password" \
+  '{summaryUrl:$summary_url,adminToken:$admin_token,dashboardUrl:$dashboard_url,dashboardUsername:$dashboard_username,dashboardPassword:$dashboard_password,role:"admin"}' > "$USAGE_ADMIN_FILE"
 chmod 0600 "$USAGE_ADMIN_FILE"
+jq -n --arg dashboard_url "https://${PUBLIC_IP}:${USAGE_PORT}/dashboard" \
+  --arg dashboard_username "$dashboard_viewer_username" --arg dashboard_password "$dashboard_viewer_password" \
+  '{dashboardUrl:$dashboard_url,dashboardUsername:$dashboard_username,dashboardPassword:$dashboard_password,role:"viewer"}' > "$USAGE_VIEWER_FILE"
+chmod 0600 "$USAGE_VIEWER_FILE"
 install -o root -g root -m 0755 "$USAGE_SOURCE" "$APP_ROOT/bin/usage_collector.py"
 
 install -d -m 0755 /usr/local/libexec
@@ -475,3 +490,4 @@ ss -ltnH "sport = :${USAGE_BACKEND_PORT}" | grep -q . || fail "usage collector b
 echo "Browser Gateway HTTP/2 installed on TCP ${LISTEN_PORT}."
 echo "Credentials remain in ${CREDENTIALS_FILE}."
 echo "Usage administrator credentials remain in ${USAGE_ADMIN_FILE}."
+echo "Usage read-only credentials remain in ${USAGE_VIEWER_FILE}."

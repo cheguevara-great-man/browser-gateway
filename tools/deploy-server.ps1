@@ -6,7 +6,8 @@ param(
     [int]$Port = 443,
     [string]$IdentityFile = (Join-Path $HOME '.ssh\browser_gateway_ed25519'),
     [string]$LocalCredentialPath = (Join-Path $HOME '.browser-gateway\deployment.local.json'),
-    [string]$UsageAdminCredentialPath = (Join-Path $HOME '.browser-gateway\usage-admin.local.json')
+    [string]$UsageAdminCredentialPath = (Join-Path $HOME '.browser-gateway\usage-admin.local.json'),
+    [string]$UsageViewerCredentialPath = (Join-Path $HOME '.browser-gateway\usage-viewer.local.json')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -32,14 +33,20 @@ $credentialDirectory = Split-Path -Parent $LocalCredentialPath
 New-Item -ItemType Directory -Path $credentialDirectory -Force | Out-Null
 $usageAdminDirectory = Split-Path -Parent $UsageAdminCredentialPath
 New-Item -ItemType Directory -Path $usageAdminDirectory -Force | Out-Null
+$usageViewerDirectory = Split-Path -Parent $UsageViewerCredentialPath
+New-Item -ItemType Directory -Path $usageViewerDirectory -Force | Out-Null
 & $scp @common "root@${Server}:/root/browser-gateway-credentials.json" $LocalCredentialPath
 if ($LASTEXITCODE -ne 0) { throw 'Failed to retrieve generated credentials.' }
 & $scp @common "root@${Server}:/root/browser-gateway-usage-admin.json" $UsageAdminCredentialPath
 if ($LASTEXITCODE -ne 0) { throw 'Failed to retrieve usage administrator credentials.' }
+& $scp @common "root@${Server}:/root/browser-gateway-usage-viewer.json" $UsageViewerCredentialPath
+if ($LASTEXITCODE -ne 0) { throw 'Failed to retrieve usage viewer credentials.' }
 & icacls.exe $LocalCredentialPath /inheritance:r /grant:r "${env:USERNAME}:(R,W)" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Failed to restrict the local credential file ACL.' }
 & icacls.exe $UsageAdminCredentialPath /inheritance:r /grant:r "${env:USERNAME}:(R,W)" | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Failed to restrict the usage administrator credential ACL.' }
+& icacls.exe $UsageViewerCredentialPath /inheritance:r /grant:r "${env:USERNAME}:(R,W)" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Failed to restrict the usage viewer credential ACL.' }
 
 $extensionBootstrap = Join-Path $root 'extension\runtime-config.json'
 $gatewayCredential = Get-Content -LiteralPath $LocalCredentialPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -61,6 +68,7 @@ $extensionCredential = [ordered]@{
 Write-Host "Browser Gateway HTTP/2 server deployed successfully on TCP $Port." -ForegroundColor Green
 Write-Host "Credentials saved locally at: $LocalCredentialPath"
 Write-Host "Usage administrator credentials saved locally at: $UsageAdminCredentialPath"
+Write-Host "Usage read-only credentials saved locally at: $UsageViewerCredentialPath"
 Write-Host "Usage dashboard: $($usageAdminCredential.dashboardUrl)"
 Write-Host "Extension bootstrap created at: $extensionBootstrap"
 Write-Host 'Credential values were not printed and both local files are excluded from Git.'
