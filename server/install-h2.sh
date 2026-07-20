@@ -51,7 +51,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl jq nginx openssl python3-venv tar
+apt-get install -y --no-install-recommends ca-certificates curl jq nginx openssl python3-venv sqlite3 tar
 
 if ! getent passwd browser-gateway >/dev/null; then
   useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin browser-gateway
