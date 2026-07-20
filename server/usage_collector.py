@@ -239,6 +239,7 @@ class Handler(BaseHTTPRequestHandler):
                     budget=float(form.get("budget", [""])[0]) if form.get("budget", [""])[0] else None,
                     machine_slots=int(form.get("machine_slots", ["6"])[0]),
                     hard_cap=form.get("hard_cap", [""])[0] == "on",
+                    reset_baseline=form.get("reset_baseline", [""])[0] == "on",
                 )
         except (ValueError, OverflowError):
             self._redirect(f"/dashboard?{urlencode({'days': days, 'error': 1})}")
@@ -487,7 +488,10 @@ def insert_quota_snapshot(path: Path, value: object) -> dict[str, object]:
             "DELETE FROM quota_snapshots WHERE received_at < ?",
             ((datetime.now(timezone.utc) - timedelta(days=90)).isoformat(),),
         )
-    return latest_quota(path) or {}
+    latest = latest_quota(path) or {}
+    if latest:
+        _ensure_official_baseline(path, latest)
+    return latest
 
 
 def latest_quota(path: Path) -> dict[str, object] | None:
@@ -528,12 +532,21 @@ def _control_settings(path: Path) -> dict[str, object]:
         "budget_credits": float(settings["control_budget_credits"]) if settings.get("control_budget_credits") else None,
         "machine_slots": int(settings.get("control_machine_slots", "6")),
         "hard_cap": settings.get("control_hard_cap", "false") == "true",
+        "baseline_at": settings.get("control_official_baseline_at", ""),
+        "baseline_used_percent": (
+            float(settings["control_official_baseline_used_percent"])
+            if settings.get("control_official_baseline_used_percent") else None
+        ),
+        "baseline_reset_at": (
+            int(settings["control_official_baseline_reset_at"])
+            if settings.get("control_official_baseline_reset_at") else None
+        ),
     }
 
 
 def set_control_settings(
     path: Path, *, mode: str = "manual", start_date: str, end_date: str, budget: float | None,
-    machine_slots: int, hard_cap: bool,
+    machine_slots: int, hard_cap: bool, reset_baseline: bool = False,
 ) -> None:
     if mode not in {"official", "manual"}:
         raise ValueError("invalid control mode")
@@ -551,6 +564,7 @@ def set_control_settings(
         stored_start, stored_end, stored_budget = start.isoformat(), end.isoformat(), str(budget)
     else:
         stored_start = stored_end = stored_budget = ""
+    previous = _control_settings(path)
     values = {
         "control_mode": mode,
         "control_start_date": stored_start,
@@ -559,6 +573,60 @@ def set_control_settings(
         "control_machine_slots": str(machine_slots),
         "control_hard_cap": "true" if hard_cap else "false",
     }
+    if mode == "official":
+        should_initialize = (
+            reset_baseline or previous["mode"] != "official" or not previous["baseline_at"]
+        )
+        quota = latest_quota(path) if should_initialize else None
+        if quota is not None and not quota["stale"]:
+            values.update(_official_baseline_values(quota))
+        elif should_initialize:
+            values.update(_empty_official_baseline_values())
+    else:
+        values.update(_empty_official_baseline_values())
+    with closing(connect(path)) as database, database:
+        for key, value in values.items():
+            database.execute(
+                "INSERT INTO dashboard_settings(setting_key,setting_value) VALUES (?,?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                (key, value),
+            )
+
+
+def _empty_official_baseline_values() -> dict[str, str]:
+    return {
+        "control_official_baseline_at": "",
+        "control_official_baseline_used_percent": "",
+        "control_official_baseline_reset_at": "",
+    }
+
+
+def _official_baseline_values(quota: dict[str, object]) -> dict[str, str]:
+    return {
+        "control_official_baseline_at": str(quota["observed_at"]),
+        "control_official_baseline_used_percent": str(quota["used_percent"]),
+        "control_official_baseline_reset_at": str(
+            int(datetime.fromisoformat(str(quota["reset_at"])).timestamp())
+        ),
+    }
+
+
+def _ensure_official_baseline(path: Path, quota: dict[str, object]) -> None:
+    control = _control_settings(path)
+    if control["mode"] != "official" or quota["stale"]:
+        return
+    reset_at = int(datetime.fromisoformat(str(quota["reset_at"])).timestamp())
+    needs_reset = (
+        not control["baseline_at"]
+        or control["baseline_reset_at"] != reset_at
+        or (
+            control["baseline_used_percent"] is not None
+            and float(quota["used_percent"]) < float(control["baseline_used_percent"])
+        )
+    )
+    if not needs_reset:
+        return
+    values = _official_baseline_values(quota)
     with closing(connect(path)) as database, database:
         for key, value in values.items():
             database.execute(
@@ -573,7 +641,22 @@ def summary(
 ) -> dict[str, object]:
     since, until, resolved_start, resolved_end = _time_bounds(days, start_date, end_date)
     current_quota = latest_quota(path)
-    if (
+    control = _control_settings(path)
+    baseline_date = ""
+    if control["baseline_at"]:
+        baseline_date = datetime.fromisoformat(
+            str(control["baseline_at"]).replace("Z", "+00:00")
+        ).astimezone(BEIJING).date().isoformat()
+    official_baseline_matches = bool(
+        control["mode"] == "official" and current_quota and control["baseline_at"]
+        and baseline_date == resolved_start and current_quota["period_end"] == resolved_end
+        and control["baseline_reset_at"]
+        == int(datetime.fromisoformat(str(current_quota["reset_at"])).timestamp())
+    )
+    if official_baseline_matches:
+        since = str(control["baseline_at"])
+        until = str(current_quota["period_end_at"])
+    elif (
         start_date and end_date and current_quota
         and current_quota["period_start"] == resolved_start
         and current_quota["period_end"] == resolved_end
@@ -680,7 +763,6 @@ def summary(
     models = sorted(model_map.values(), key=lambda item: item["estimated_credits"], reverse=True)
     average = round(sum(item["estimated_credits"] for item in machines) / len(machines), 6) if machines else 0.0
     highest = max((item["estimated_credits"] for item in machines), default=0.0)
-    control = _control_settings(path)
     quota = current_quota
     manual_matches = bool(
         control["mode"] == "manual"
@@ -689,7 +771,7 @@ def summary(
     quota_matches = bool(
         quota and quota["period_start"] == resolved_start and quota["period_end"] == resolved_end
     )
-    official_matches = bool(control["mode"] == "official" and quota_matches)
+    official_matches = official_baseline_matches
     control_matches = manual_matches or official_matches
     legacy_budget = float(budget_row[0]) if budget_row is not None and not control_matches else None
     budget = control["budget_credits"] if manual_matches else legacy_budget
@@ -699,16 +781,27 @@ def summary(
         else 6
     )
     tracked_credits = round(sum(item["estimated_credits"] for item in machines), 6)
+    baseline_used_percent = float(control["baseline_used_percent"] or 0)
+    incremental_used_percent = (
+        round(max(float(quota["used_percent"]) - baseline_used_percent, 0), 6)
+        if official_matches and quota else None
+    )
+    allocatable_percent = (
+        round(max(100.0 - baseline_used_percent, 0), 6) if official_matches else None
+    )
     inferred_budget = None
-    if quota_matches and quota and 0 < float(quota["used_percent"]) <= 100:
-        inferred_budget = round(tracked_credits / (float(quota["used_percent"]) / 100), 6)
+    if official_matches and incremental_used_percent and incremental_used_percent > 0:
+        inferred_total = tracked_credits / (incremental_used_percent / 100)
+        inferred_budget = round(inferred_total * (float(allocatable_percent) / 100), 6)
     allocation_budget = (
         control["budget_credits"] if manual_matches
         else inferred_budget if official_matches
         else legacy_budget
     )
     target = round(allocation_budget / slots, 6) if allocation_budget is not None else None
-    target_account_percent = round(100.0 / slots, 6) if official_matches else None
+    target_account_percent = (
+        round(float(allocatable_percent) / slots, 6) if allocatable_percent is not None else None
+    )
     for machine in machines:
         machine["deviation_percent"] = (
             round((machine["estimated_credits"] / average - 1) * 100, 1) if average else 0.0
@@ -718,8 +811,8 @@ def summary(
             round(max(target - machine["estimated_credits"], 0), 6) if target is not None else None
         )
         machine["account_quota_percent"] = (
-            round(float(quota["used_percent"]) * machine["estimated_credits"] / tracked_credits, 4)
-            if official_matches and quota and tracked_credits > 0 else None
+            round(float(incremental_used_percent) * machine["estimated_credits"] / tracked_credits, 4)
+            if official_matches and incremental_used_percent is not None and tracked_credits > 0 else None
         )
         machine["allocation_status"] = (
             "limit" if target_account_percent is not None and machine["account_quota_percent"] is not None
@@ -728,7 +821,7 @@ def summary(
                 and machine["account_quota_percent"] >= target_account_percent * 0.9
             else "limit" if manual_matches and target is not None and machine["estimated_credits"] >= target
             else "reduce" if manual_matches and target is not None and machine["estimated_credits"] >= target * 0.9
-            else "available" if target is not None else "unconfigured"
+            else "available" if target is not None or target_account_percent is not None else "unconfigured"
         )
     daily_map: dict[str, dict[str, object]] = {}
     for row in daily_rows:
@@ -791,6 +884,12 @@ def summary(
         ),
         "per_machine_target": target,
         "per_machine_target_percent": target_account_percent,
+        "official_baseline": {
+            "observed_at": control["baseline_at"],
+            "used_percent": control["baseline_used_percent"],
+            "remaining_percent": allocatable_percent,
+        } if official_matches else None,
+        "official_incremental_used_percent": incremental_used_percent,
         "average_estimated_credits": average,
         "quota": quota,
         "control": control,
@@ -951,6 +1050,11 @@ def _query_scope(query: str, database: Path) -> tuple[int, str | None, str | Non
     if control["mode"] == "manual" and control["start_date"] and control["end_date"]:
         return 30, str(control["start_date"]), str(control["end_date"])
     quota = latest_quota(database)
+    if control["mode"] == "official" and control["baseline_at"] and quota is not None:
+        start = datetime.fromisoformat(
+            str(control["baseline_at"]).replace("Z", "+00:00")
+        ).astimezone(BEIJING).date().isoformat()
+        return 30, start, str(quota["period_end"])
     if quota is not None:
         return 30, str(quota["period_start"]), str(quota["period_end"])
     return 30, None, None
@@ -968,12 +1072,19 @@ def machine_policy(path: Path, machine_id: str) -> dict[str, object]:
             return {"blocked": False, "reason": "official_quota_unavailable", "mode": "official"}
         if quota["stale"]:
             return {"blocked": False, "reason": "official_quota_stale", "mode": "official"}
+        if not control["baseline_at"] or control["baseline_used_percent"] is None:
+            return {"blocked": False, "reason": "official_baseline_unavailable", "mode": "official"}
+        if control["baseline_reset_at"] != int(datetime.fromisoformat(str(quota["reset_at"])).timestamp()):
+            return {"blocked": False, "reason": "official_baseline_window_mismatch", "mode": "official"}
+        baseline_start = datetime.fromisoformat(
+            str(control["baseline_at"]).replace("Z", "+00:00")
+        ).astimezone(BEIJING).date().isoformat()
         data = summary(
-            path, start_date=str(quota["period_start"]), end_date=str(quota["period_end"])
+            path, start_date=baseline_start, end_date=str(quota["period_end"])
         )
         machine = next((item for item in data["machines"] if item["machine_id"] == machine_id), None)
         used_percent = float(machine["account_quota_percent"] or 0) if machine else 0.0
-        limit_percent = 100.0 / int(control["machine_slots"])
+        limit_percent = float(data["per_machine_target_percent"] or 0)
         if data["totals"]["estimated_credits"] <= 0:
             return {"blocked": False, "reason": "insufficient_tracked_usage", "mode": "official"}
         blocked = used_percent >= limit_percent
@@ -984,7 +1095,9 @@ def machine_policy(path: Path, machine_id: str) -> dict[str, object]:
             "limit_account_percent": round(limit_percent, 6),
             "remaining_account_percent": round(max(limit_percent - used_percent, 0), 6),
             "official_used_percent": quota["used_percent"],
-            "period_start": quota["period_start"], "period_end": quota["period_end"],
+            "baseline_used_percent": control["baseline_used_percent"],
+            "baseline_at": control["baseline_at"],
+            "period_start": baseline_start, "period_end": quota["period_end"],
             "hard_cap_enabled": True,
         }
     if not control["start_date"] or not control["end_date"] or control["budget_credits"] is None:
@@ -1066,7 +1179,7 @@ def _overview_page(data: dict[str, object], days: int) -> str:
     if quota:
         stale = " · 数据超过 20 分钟未更新" if quota["stale"] else ""
         inferred = (
-            f' · 推算总额度 {_credits(data["inferred_budget_credits"])} Credits'
+            f' · 推算本次可分配 {_credits(data["inferred_budget_credits"])} Credits'
             if data["inferred_budget_credits"] is not None else ""
         )
         quota_html = f'''<section class="quota-strip"><div><span>官方当前窗口</span><strong>已用 {quota['used_percent']:g}% · 剩余 {quota['remaining_percent']:g}%</strong></div>
@@ -1172,12 +1285,14 @@ def _machine_total_chart(data: dict[str, object]) -> str:
         rows.append(f'''<div class="total-row"><div><strong>{html.escape(item['machine_name'])}</strong><span class="advice {css}">{advice}</span></div>
 <div class="total-bar {css}" title="{html.escape(bar_title, quote=True)}"><i class="used" style="width:{progress:.1f}%"></i><i class="remaining" style="width:{remaining_width:.1f}%"></i></div><b>{_credits(item['estimated_credits'])}</b></div>''')
     if data["allocation_mode"] == "official" and data["per_machine_target_percent"] is not None:
-        target_note = f'<p class="target-note">官方窗口自动 {data["machine_slots"]} 等分：每台最多占账户总额度 {data["per_machine_target_percent"]:.2f}%（按已记录用量比例估算）</p>'
+        baseline_remaining = data["official_baseline"]["remaining_percent"]
+        target_note = f'<p class="target-note">统计开始时官方剩余 {baseline_remaining:g}%，按 {data["machine_slots"]} 台等分：每台可用账户总额度 {data["per_machine_target_percent"]:.2f}%（部署前消耗不参与）</p>'
     elif target is not None:
         target_note = f'<p class="target-note">手动预算 {data["machine_slots"]} 等分：每台 {_credits(target)} Credits</p>'
     else:
         target_note = '<p class="target-note">等待官方 Usage 快照或完整的手动预算设置</p>'
-    legend = '<div class="quota-legend"><span><i class="used"></i>已用</span><span><i class="remaining"></i>剩余至本机均分上限</span></div>' if target is not None else ""
+    has_limit = target is not None or data.get("per_machine_target_percent") is not None
+    legend = '<div class="quota-legend"><span><i class="used"></i>已用</span><span><i class="remaining"></i>剩余至本机均分上限</span></div>' if has_limit else ""
     return f'<div class="total-chart">{legend}{"".join(rows)}{target_note}</div>'
 
 
@@ -1269,8 +1384,14 @@ def _settings_page(data: dict[str, object], session: str, role: str, days: int, 
     control_start = control["start_date"] or data["start_date"]
     control_end = control["end_date"] or data["end_date"]
     quota = data.get("quota")
+    baseline_note = (
+        f' 本次统计从 {html.escape(_short_time(control["baseline_at"]))} 开始；当时官方剩余 {100-float(control["baseline_used_percent"]):g}%，此前消耗不参与设备分配。'
+        if control["baseline_at"] and control["baseline_used_percent"] is not None else
+        " 尚未建立统计基线；收到下一份新鲜官方快照后自动开始。"
+    )
     official_status = (
         f'当前官方窗口：{html.escape(_short_time(quota["period_start_at"]))} 至 {html.escape(_short_time(quota["period_end_at"]))}（北京时间），已用 {quota["used_percent"]:g}%，剩余 {quota["remaining_percent"]:g}%。'
+        + baseline_note
         + (" 快照已过期，硬上限暂时放行。" if quota["stale"] else "")
         if quota else "尚未收到官方 Usage 快照；选择后会等待 Bridge 自动同步。"
     )
@@ -1290,7 +1411,7 @@ def _settings_page(data: dict[str, object], session: str, role: str, days: int, 
 <label>缓存<input type="number" name="cached_rate" min="0" max="100000" step="0.001" value="{rates[1]}"></label>
 <label>输出<input type="number" name="output_rate" min="0" max="100000" step="0.001" value="{rates[2]}"></label><button>保存</button></form></td></tr>""")
     return f"""<section class="panel"><div class="panel-head"><div><h2>额度分配模式</h2><p>两种模式互斥：使用官方当前窗口自动分配，或者完全使用你填写的周期和预算。</p></div></div>
-<form class="control-form" method="post" action="/dashboard/control"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="days" value="{days}">
+<form id="quota-control-form" class="control-form" method="post" action="/dashboard/control"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="days" value="{days}">
 <div class="mode-options"><label class="mode-card"><input type="radio" name="control_mode" value="official"{official_checked}><strong>官方额度自动六等分</strong><span>自动采用官方窗口起止时间；根据官方已用比例和各设备已记录 Credits 占比估算设备额度。</span></label>
 <label class="mode-card"><input type="radio" name="control_mode" value="manual"{manual_checked}><strong>手动周期与预算</strong><span>使用你填写的日期和总 Credits，不依赖官方 Usage 快照。</span></label></div>
 <div class="official-mode"><strong>官方模式状态</strong><p>{official_status}</p></div>
@@ -1299,6 +1420,7 @@ def _settings_page(data: dict[str, object], session: str, role: str, days: int, 
 <label>周期总 Credits<input type="number" name="budget" min="0.000001" step="0.01" placeholder="例如 1200" value="{budget}"></label></div>
 <label>均分设备数<input type="number" name="machine_slots" min="1" max="100" step="1" value="{control['machine_slots']}" required></label>
 <label class="check"><input type="checkbox" name="hard_cap"{hard_checked}> 达到均分上限后自动禁用该机模型请求</label><button>保存控制设置</button></form>
+<label class="baseline-reset"><input type="checkbox" name="reset_baseline" form="quota-control-form"> 重新以保存时的官方剩余额度作为统计起点</label>
 <p class="safety-note">官方模式的单机占比是根据 Bridge 已记录用量估算的；快照过期或记录不足时自动放行。手动模式按明确 Credits 硬上限执行。中央服务不可达时客户端沿用最近策略。</p></section>
 <section class="panel"><div class="panel-head"><div><h2>标准模型费率</h2><p>单位：每 100 万 Token 的 Credits。Fast 倍数由系统在标准费率之外自动应用。</p></div></div>
 <div class="table-wrap"><table><thead><tr><th>模型</th><th>输入 / 缓存 / 输出</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="2" class="empty">收到模型数据后可修改费率</td></tr>'}</tbody></table></div></section>"""
@@ -1353,6 +1475,7 @@ main{max-width:1440px;margin:auto;padding:22px}.toolbar{display:flex;justify-con
 .dashboard-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:18px}.chart-panel,.total-panel{margin-top:0}.line-chart{padding:0 18px 18px}.line-chart svg{display:block;width:100%;height:auto;min-height:260px}.line-chart text{font-size:11px;fill:#718096}.gridline{stroke:#e6edf7;stroke-width:1}.legend{display:flex;flex-wrap:wrap;gap:10px 18px;justify-content:center}.legend span{font-size:12px;color:#52647b}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.quota-strip{display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:28px;background:#eaf2ff;border:1px solid #c9dcff;border-radius:14px;padding:14px 18px;margin-bottom:18px}.quota-strip span{display:block;font-size:11px;color:#64748b}.quota-strip strong{display:block;margin-top:3px}.quota-strip p{text-align:right;color:#52647b;font-size:12px}.quota-strip.muted{display:block;color:#718096}.total-chart{padding:0 20px 18px}.total-row{display:grid;grid-template-columns:minmax(120px,1.25fr) minmax(70px,1fr) auto;align-items:center;gap:10px;padding:11px 0;border-top:1px solid #edf1f7}.total-row strong{display:block;font-size:13px}.total-row b{font-size:13px}.total-bar{height:8px;background:#e8eef8;border-radius:8px}.total-bar i{display:block;height:100%;background:linear-gradient(90deg,#2463eb,#5b8def);border-radius:8px}.advice{display:block;font-size:10px;margin-top:3px}.advice.limit{color:#c53030}.advice.reduce{color:#b7791f}.advice.available{color:#218358}.advice.neutral{color:#718096}.target-note{font-size:12px;color:#52647b;background:#f7f9fc;padding:10px;border-radius:8px;margin-top:8px}.control-form{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:12px;padding:0 20px 18px;align-items:end}.control-form label{font-size:11px;color:#718096}.control-form input{display:block;width:100%;margin-top:4px}.mode-options{grid-column:1/5;display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode-card{position:relative;padding:15px 15px 15px 44px;border:1px solid #dbe4f0;border-radius:12px;background:#f9fbfe;cursor:pointer}.mode-card input{position:absolute;left:15px;top:16px;width:auto;margin:0}.mode-card strong,.mode-card span{display:block}.mode-card strong{font-size:14px;color:#253858}.mode-card span{font-size:12px;line-height:1.55;margin-top:5px}.mode-card:has(input:checked){border-color:#2463eb;background:#eef4ff;box-shadow:0 0 0 1px #2463eb}.official-mode{grid-column:1/5;padding:11px 13px;border-radius:9px;background:#f1f6ff;color:#52647b}.official-mode strong{font-size:12px}.official-mode p{font-size:12px;margin-top:4px}.manual-fields{grid-column:1/5;display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.manual-fields label{display:block}.control-form .check{grid-column:1/4;display:flex;align-items:center;gap:8px;font-size:13px;color:#52647b}.control-form .check input{width:auto;margin:0}.safety-note{margin:0 20px 20px;color:#8a5b00;background:#fff8e6;padding:10px;border-radius:8px;font-size:12px}
 .control-form:has(input[value="official"]:checked) .manual-fields{opacity:.42}.control-form:has(input[value="manual"]:checked) .official-mode{opacity:.42}
 .total-bar{display:flex;overflow:hidden}.total-bar i{border-radius:0}.total-bar .used{background:linear-gradient(90deg,#2463eb,#5b8def)}.total-bar .remaining{background:#dce7f7}.total-bar.limit .used{background:linear-gradient(90deg,#e05252,#c53030)}.total-bar.reduce .used{background:linear-gradient(90deg,#eab84b,#d69e2e)}.quota-legend{display:flex;gap:16px;justify-content:flex-end;padding:0 0 8px;font-size:11px;color:#718096}.quota-legend i{display:inline-block;width:11px;height:7px;border-radius:4px;margin-right:5px}.quota-legend .used{background:#3974e8}.quota-legend .remaining{background:#dce7f7}
+.baseline-reset{display:flex;align-items:center;gap:8px;margin:-5px 20px 18px;color:#52647b;font-size:12px}.baseline-reset input{width:auto;margin:0}
  button{border:0;border-radius:8px;background:#2463eb;color:white;padding:9px 14px;font-weight:600;cursor:pointer}input{border:1px solid #ccd6e5;border-radius:8px;padding:9px;background:white}.inline,.budget{display:flex;gap:7px}.rates label{font-size:11px;color:#718096}.rates input{display:block;width:78px;padding:6px}.budget input{width:250px}.empty{text-align:center;color:#718096;padding:32px}.foot{text-align:center;color:#718096;padding:26px;font-size:13px}
 .login-body{min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#edf4ff,#f8fbff)}.login-card{width:min(390px,92vw);padding:30px;background:white;border-radius:18px;box-shadow:0 18px 60px #18375d22}.login-card .muted{color:#718096;margin:8px 0 22px}.login-card label{display:block;margin:14px 0;color:#52647b}.login-card input{display:block;width:100%;margin-top:6px}.login-card button{width:100%;margin-top:8px}.error{color:#c53030;background:#fff5f5;padding:10px;border-radius:8px}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.split,.dashboard-grid{grid-template-columns:1fr}.panel-head{align-items:flex-start;flex-direction:column}.budget{width:100%}.budget input{flex:1}main{padding:14px}.toolbar{align-items:flex-start;flex-direction:column}.date-filter{width:100%;overflow:auto}.quota-strip{grid-template-columns:1fr 1fr}.quota-strip p{grid-column:1/3;text-align:left}.control-form{grid-template-columns:repeat(2,1fr)}.mode-options,.official-mode,.manual-fields{grid-column:1/3}.control-form .check{grid-column:1/3}}

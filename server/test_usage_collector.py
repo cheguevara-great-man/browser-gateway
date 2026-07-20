@@ -77,25 +77,47 @@ class CollectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "usage.sqlite3"
             MODULE.initialize(database)
-            MODULE.insert_events(database, [self.event()])
-            now = int(time.time())
+            # Usage that happened before tracking starts must not be assigned to devices.
+            observed = datetime.now(timezone.utc).replace(microsecond=0)
+            pre_start = self.event()
+            pre_start["occurred_at"] = (observed - timedelta(minutes=1)).isoformat()
+            MODULE.insert_events(database, [pre_start])
+            reset_at = int(time.time()) + 3 * 86400
             quota = {
                 "machine_id": "machine-1",
-                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "observed_at": observed.isoformat(),
                 "plan_type": "pro",
                 "used_percent": 20,
                 "allowed": True,
                 "limit_reached": False,
                 "limit_window_seconds": 604800,
-                "reset_at": now + 3 * 86400,
+                "reset_at": reset_at,
             }
             latest = MODULE.insert_quota_snapshot(database, quota)
-            result = MODULE.summary(
-                database, start_date=latest["period_start"], end_date=latest["period_end"]
+            baseline = MODULE._control_settings(database)
+            self.assertEqual(baseline["baseline_used_percent"], 20)
+            self.assertEqual(baseline["baseline_at"], observed.isoformat())
+            start_date = observed.astimezone(MODULE.BEIJING).date().isoformat()
+            initial = MODULE.summary(
+                database, start_date=start_date, end_date=latest["period_end"]
             )
-            self.assertEqual(result["quota"]["remaining_percent"], 80)
+            self.assertEqual(initial["totals"]["requests"], 0)
+
+            post_start = self.event("post-start")
+            post_start["occurred_at"] = (observed + timedelta(minutes=1)).isoformat()
+            MODULE.insert_events(database, [post_start])
+            quota["observed_at"] = (observed + timedelta(minutes=2)).isoformat()
+            quota["used_percent"] = 40
+            latest = MODULE.insert_quota_snapshot(database, quota)
+            result = MODULE.summary(
+                database, start_date=start_date, end_date=latest["period_end"]
+            )
+            self.assertEqual(result["quota"]["remaining_percent"], 60)
+            self.assertEqual(result["official_baseline"]["remaining_percent"], 80)
+            self.assertEqual(result["official_incremental_used_percent"], 20)
+            self.assertEqual(result["totals"]["requests"], 1)
             self.assertAlmostEqual(
-                result["inferred_budget_credits"], result["totals"]["estimated_credits"] / 0.2,
+                result["inferred_budget_credits"], result["totals"]["estimated_credits"] / 0.2 * 0.8,
                 places=6,
             )
             self.assertAlmostEqual(
@@ -105,11 +127,31 @@ class CollectorTests(unittest.TestCase):
                 database, mode="official", start_date="", end_date="", budget=None,
                 machine_slots=6, hard_cap=True,
             )
+            preserved = MODULE._control_settings(database)
+            self.assertEqual(preserved["baseline_at"], observed.isoformat())
+            self.assertEqual(preserved["baseline_used_percent"], 20)
             official_policy = MODULE.machine_policy(database, "machine-1")
             self.assertTrue(official_policy["blocked"])
             self.assertEqual(official_policy["mode"], "official")
             self.assertAlmostEqual(official_policy["used_account_percent"], 20.0)
-            self.assertAlmostEqual(official_policy["limit_account_percent"], 100 / 6, places=6)
+            self.assertAlmostEqual(official_policy["limit_account_percent"], 80 / 6, places=6)
+            self.assertEqual(official_policy["baseline_used_percent"], 20)
+            # A quota refresh that lowers used_percent (for example a reset card)
+            # starts a new baseline instead of producing negative consumption.
+            quota["observed_at"] = (observed + timedelta(minutes=3)).isoformat()
+            quota["used_percent"] = 5
+            MODULE.insert_quota_snapshot(database, quota)
+            refreshed = MODULE._control_settings(database)
+            self.assertEqual(refreshed["baseline_used_percent"], 5)
+            self.assertEqual(refreshed["baseline_at"], quota["observed_at"])
+            quota["observed_at"] = (observed + timedelta(minutes=4)).isoformat()
+            quota["used_percent"] = 8
+            quota["reset_at"] = reset_at + 7 * 86400
+            MODULE.insert_quota_snapshot(database, quota)
+            new_window = MODULE._control_settings(database)
+            self.assertEqual(new_window["baseline_used_percent"], 8)
+            self.assertEqual(new_window["baseline_at"], quota["observed_at"])
+            self.assertEqual(new_window["baseline_reset_at"], quota["reset_at"])
             today = datetime.now(MODULE.BEIJING).date().isoformat()
             MODULE.set_control_settings(
                 database, mode="manual", start_date=today, end_date=today, budget=0.001,
