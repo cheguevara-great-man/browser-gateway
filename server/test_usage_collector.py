@@ -101,14 +101,24 @@ class CollectorTests(unittest.TestCase):
             self.assertAlmostEqual(
                 result["per_machine_target"], result["inferred_budget_credits"] / 6, places=6
             )
+            MODULE.set_control_settings(
+                database, mode="official", start_date="", end_date="", budget=None,
+                machine_slots=6, hard_cap=True,
+            )
+            official_policy = MODULE.machine_policy(database, "machine-1")
+            self.assertTrue(official_policy["blocked"])
+            self.assertEqual(official_policy["mode"], "official")
+            self.assertAlmostEqual(official_policy["used_account_percent"], 20.0)
+            self.assertAlmostEqual(official_policy["limit_account_percent"], 100 / 6, places=6)
             today = datetime.now(MODULE.BEIJING).date().isoformat()
             MODULE.set_control_settings(
-                database, start_date=today, end_date=today, budget=0.001,
+                database, mode="manual", start_date=today, end_date=today, budget=0.001,
                 machine_slots=6, hard_cap=True,
             )
             policy = MODULE.machine_policy(database, "machine-1")
             self.assertTrue(policy["blocked"])
             self.assertEqual(policy["reason"], "machine_credit_limit_reached")
+            self.assertEqual(policy["mode"], "manual")
 
     def test_signed_dashboard_session_expires_and_rejects_tampering(self) -> None:
         token = MODULE.create_session(b"secret", role="admin", now=1_000)
@@ -129,6 +139,37 @@ class CollectorTests(unittest.TestCase):
             result = MODULE.summary(database, 30)
             credits = {item["service_tier"]: item["estimated_credits"] for item in result["models"]}
             self.assertAlmostEqual(credits["priority"], credits["default"] * 2, delta=0.000002)
+
+    def test_control_modes_are_mutually_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "usage.sqlite3"
+            MODULE.initialize(database)
+            MODULE.set_control_settings(
+                database, mode="official", start_date="ignored", end_date="ignored",
+                budget=999, machine_slots=6, hard_cap=True,
+            )
+            official = MODULE._control_settings(database)
+            self.assertEqual(official["mode"], "official")
+            self.assertEqual(official["start_date"], "")
+            self.assertIsNone(official["budget_credits"])
+            with self.assertRaises(ValueError):
+                MODULE.set_control_settings(
+                    database, mode="manual", start_date="2026-07-01", end_date="2026-07-31",
+                    budget=None, machine_slots=6, hard_cap=False,
+                )
+            MODULE.set_control_settings(
+                database, mode="manual", start_date="2026-07-01", end_date="2026-07-31",
+                budget=1200, machine_slots=6, hard_cap=False,
+            )
+            manual = MODULE._control_settings(database)
+            self.assertEqual(manual["mode"], "manual")
+            self.assertEqual(manual["budget_credits"], 1200)
+            page = MODULE.dashboard_page(
+                MODULE.summary(database, start_date="2026-07-01", end_date="2026-07-31"),
+                "session", "admin", 30, b"secret", page="settings",
+            )
+            self.assertIn("官方额度自动六等分", page)
+            self.assertIn("手动周期与预算", page)
 
     def test_rejects_impossible_totals_and_extra_fields(self) -> None:
         event = self.event()

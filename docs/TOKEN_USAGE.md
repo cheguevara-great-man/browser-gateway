@@ -76,18 +76,25 @@ Bridge 2.7/2.8 已排队事件继续兼容。
 
 - `/dashboard`：设备日 Credits 折线图、统计期设备总额、官方已用/剩余比例与公平建议；
 - `/dashboard/daily`：兼容旧链接，自动显示新总览；
-- `/dashboard/machines`：机器对比；
-- `/dashboard/machine?id=<机器ID>`：单机模型组合与每日历史；
-- `/dashboard/models`：模型、推理、速度、倍率和 Token 构成；
-- `/dashboard/settings`：管理员预算与费率设置。
+- `/dashboard/machines`（设备额度）：比较单机占额、均分上限、状态、Credits 和最后使用时间；
+- `/dashboard/machine?id=<机器ID>`：追查一台设备的模型组合和每日历史；
+- `/dashboard/models`（计费明细）：审计模型、推理档位、Fast 倍率、Token 构成、费率及未定价模型；
+- `/dashboard/settings`：选择官方/手动额度模式，设置硬上限，并维护模型标准费率。
 
 页面查询支持 `?start=YYYY-MM-DD&end=YYYY-MM-DD`，最长 366 天。登录后的只读会话也能读取
 `/v1/usage/summary`，因此以后可以把前端改成独立 JavaScript、React 或其他展示，而不用修改
 数据库和聚合层。
 
-管理员可以设置控制周期、周期总 Credits、均分设备数以及可选硬上限。硬上限只使用管理员明确
-填写的预算，不使用根据官方百分比推算的额度，避免漏记用量或活动刷新造成误停。达到上限后客户端
-最多在完成当前任务后阻止下一次模型请求；其他产品接口不受影响。
+设置页提供两种互斥模式：
+
+1. **官方额度自动六等分**：自动采用最新官方 Usage 窗口的起止时间，并用“官方已用比例 ×
+   本机 Credits / 全部已记录 Credits”估算每台设备占整个账号额度的比例；六台机器的目标各为
+   `16.67%`。快照超过 20 分钟或没有足够已记录用量时自动放行。
+2. **手动周期与预算**：完全使用管理员填写的开始日期、结束日期和周期总 Credits；单机上限为
+   `周期总 Credits ÷ 设备数`。
+
+两种模式都可以只给建议，也可以显式开启硬上限。达到上限后客户端最多在完成当前任务后阻止
+下一次模型请求；登录、历史、额度同步和其他产品接口不受影响。
 
 会话有效期 12 小时，Cookie 使用 `Secure`、`HttpOnly` 和 `SameSite=Strict`；所有修改表单使用
 CSRF Token。登录失败有固定延迟，Nginx 对公网请求限速。
@@ -153,8 +160,9 @@ sqlite3 /var/lib/browser-gateway/usage.sqlite3 'select count(*) from usage_event
 
 ## 解释统计结果
 
-网页中的 Credits 是“按公开规则复算的估算消耗”，用途是比较机器和工作模式。它不代表账号官方
-剩余 Credits，也无法推断准确重置时间。若网页估算与 OpenAI Usage 页面有差异，应优先检查：
+网页中的 Credits 是“按公开规则复算的估算消耗”，用途是比较机器和工作模式；官方 Usage 快照
+提供已用比例和重置时间，但不提供固定 Credits 总额。官方自动模式对单机账号占比的计算依赖
+Bridge 已记录流量，若网页估算与 OpenAI Usage 页面有差异，应优先检查：
 
 1. 是否启用了 Fast；
 2. 是否出现未知或研究预览模型；

@@ -233,6 +233,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 set_control_settings(
                     self.server.database,
+                    mode=form.get("control_mode", ["official"])[0],
                     start_date=form.get("start_date", [""])[0],
                     end_date=form.get("end_date", [""])[0],
                     budget=float(form.get("budget", [""])[0]) if form.get("budget", [""])[0] else None,
@@ -519,7 +520,9 @@ def _control_settings(path: Path) -> dict[str, object]:
         settings = dict(database.execute(
             "SELECT setting_key,setting_value FROM dashboard_settings WHERE setting_key LIKE 'control_%'"
         ))
+    legacy_manual = bool(settings.get("control_start_date") and settings.get("control_end_date"))
     return {
+        "mode": settings.get("control_mode", "manual" if legacy_manual else "official"),
         "start_date": settings.get("control_start_date", ""),
         "end_date": settings.get("control_end_date", ""),
         "budget_credits": float(settings["control_budget_credits"]) if settings.get("control_budget_credits") else None,
@@ -529,25 +532,30 @@ def _control_settings(path: Path) -> dict[str, object]:
 
 
 def set_control_settings(
-    path: Path, *, start_date: str, end_date: str, budget: float | None,
+    path: Path, *, mode: str = "manual", start_date: str, end_date: str, budget: float | None,
     machine_slots: int, hard_cap: bool,
 ) -> None:
-    start = _date_value(start_date)
-    end = _date_value(end_date)
-    if start > end:
-        raise ValueError("start after end")
-    if (end - start).days > 366:
-        raise ValueError("period too long")
-    if budget is not None and not 0.000001 <= budget <= 10_000_000_000:
-        raise ValueError("invalid budget")
+    if mode not in {"official", "manual"}:
+        raise ValueError("invalid control mode")
     if not 1 <= machine_slots <= 100:
         raise ValueError("invalid machine slots")
-    if hard_cap and budget is None:
-        raise ValueError("hard cap requires explicit budget")
+    if mode == "manual":
+        start = _date_value(start_date)
+        end = _date_value(end_date)
+        if start > end:
+            raise ValueError("start after end")
+        if (end - start).days > 366:
+            raise ValueError("period too long")
+        if budget is None or not 0.000001 <= budget <= 10_000_000_000:
+            raise ValueError("manual mode requires budget")
+        stored_start, stored_end, stored_budget = start.isoformat(), end.isoformat(), str(budget)
+    else:
+        stored_start = stored_end = stored_budget = ""
     values = {
-        "control_start_date": start.isoformat(),
-        "control_end_date": end.isoformat(),
-        "control_budget_credits": "" if budget is None else str(budget),
+        "control_mode": mode,
+        "control_start_date": stored_start,
+        "control_end_date": stored_end,
+        "control_budget_credits": stored_budget,
         "control_machine_slots": str(machine_slots),
         "control_hard_cap": "true" if hard_cap else "false",
     }
@@ -674,27 +682,33 @@ def summary(
     highest = max((item["estimated_credits"] for item in machines), default=0.0)
     control = _control_settings(path)
     quota = current_quota
-    control_matches = (
-        control["start_date"] == resolved_start and control["end_date"] == resolved_end
+    manual_matches = bool(
+        control["mode"] == "manual"
+        and control["start_date"] == resolved_start and control["end_date"] == resolved_end
     )
-    budget = (
-        control["budget_credits"] if control_matches
-        else float(budget_row[0]) if budget_row is not None else None
+    quota_matches = bool(
+        quota and quota["period_start"] == resolved_start and quota["period_end"] == resolved_end
     )
+    official_matches = bool(control["mode"] == "official" and quota_matches)
+    control_matches = manual_matches or official_matches
+    legacy_budget = float(budget_row[0]) if budget_row is not None and not control_matches else None
+    budget = control["budget_credits"] if manual_matches else legacy_budget
     slots = int(
         control["machine_slots"] if control_matches
         else max(len(machines), 1) if budget_row is not None
         else 6
     )
     tracked_credits = round(sum(item["estimated_credits"] for item in machines), 6)
-    quota_matches = bool(
-        quota and quota["period_start"] == resolved_start and quota["period_end"] == resolved_end
-    )
     inferred_budget = None
     if quota_matches and quota and 0 < float(quota["used_percent"]) <= 100:
         inferred_budget = round(tracked_credits / (float(quota["used_percent"]) / 100), 6)
-    allocation_budget = budget if budget is not None else inferred_budget
+    allocation_budget = (
+        control["budget_credits"] if manual_matches
+        else inferred_budget if official_matches
+        else legacy_budget
+    )
     target = round(allocation_budget / slots, 6) if allocation_budget is not None else None
+    target_account_percent = round(100.0 / slots, 6) if official_matches else None
     for machine in machines:
         machine["deviation_percent"] = (
             round((machine["estimated_credits"] / average - 1) * 100, 1) if average else 0.0
@@ -703,9 +717,17 @@ def summary(
         machine["budget_remaining"] = (
             round(max(target - machine["estimated_credits"], 0), 6) if target is not None else None
         )
+        machine["account_quota_percent"] = (
+            round(float(quota["used_percent"]) * machine["estimated_credits"] / tracked_credits, 4)
+            if official_matches and quota and tracked_credits > 0 else None
+        )
         machine["allocation_status"] = (
-            "limit" if target is not None and machine["estimated_credits"] >= target
-            else "reduce" if target is not None and machine["estimated_credits"] >= target * 0.9
+            "limit" if target_account_percent is not None and machine["account_quota_percent"] is not None
+                and machine["account_quota_percent"] >= target_account_percent
+            else "reduce" if target_account_percent is not None and machine["account_quota_percent"] is not None
+                and machine["account_quota_percent"] >= target_account_percent * 0.9
+            else "limit" if manual_matches and target is not None and machine["estimated_credits"] >= target
+            else "reduce" if manual_matches and target is not None and machine["estimated_credits"] >= target * 0.9
             else "available" if target is not None else "unconfigured"
         )
     daily_map: dict[str, dict[str, object]] = {}
@@ -761,9 +783,14 @@ def summary(
         "budget_credits": budget,
         "allocation_budget_credits": allocation_budget,
         "inferred_budget_credits": inferred_budget,
+        "allocation_mode": control["mode"] if control_matches else "legacy" if legacy_budget else "none",
         "machine_slots": slots,
-        "hard_cap_enabled": bool(control["hard_cap"] and control_matches and budget is not None),
+        "hard_cap_enabled": bool(
+            control["hard_cap"] and control_matches
+            and (manual_matches or (quota and not quota["stale"] and tracked_credits > 0))
+        ),
         "per_machine_target": target,
+        "per_machine_target_percent": target_account_percent,
         "average_estimated_credits": average,
         "quota": quota,
         "control": control,
@@ -921,7 +948,7 @@ def _query_scope(query: str, database: Path) -> tuple[int, str | None, str | Non
     if "days" in values:
         return _query_days(query), None, None
     control = _control_settings(database)
-    if control["start_date"] and control["end_date"]:
+    if control["mode"] == "manual" and control["start_date"] and control["end_date"]:
         return 30, str(control["start_date"]), str(control["end_date"])
     quota = latest_quota(database)
     if quota is not None:
@@ -933,11 +960,36 @@ def machine_policy(path: Path, machine_id: str) -> dict[str, object]:
     if not machine_id or len(machine_id) > 64:
         raise ValueError("invalid machine id")
     control = _control_settings(path)
+    if not control["hard_cap"]:
+        return {"blocked": False, "reason": "hard_cap_disabled", "mode": control["mode"]}
+    if control["mode"] == "official":
+        quota = latest_quota(path)
+        if quota is None:
+            return {"blocked": False, "reason": "official_quota_unavailable", "mode": "official"}
+        if quota["stale"]:
+            return {"blocked": False, "reason": "official_quota_stale", "mode": "official"}
+        data = summary(
+            path, start_date=str(quota["period_start"]), end_date=str(quota["period_end"])
+        )
+        machine = next((item for item in data["machines"] if item["machine_id"] == machine_id), None)
+        used_percent = float(machine["account_quota_percent"] or 0) if machine else 0.0
+        limit_percent = 100.0 / int(control["machine_slots"])
+        if data["totals"]["estimated_credits"] <= 0:
+            return {"blocked": False, "reason": "insufficient_tracked_usage", "mode": "official"}
+        blocked = used_percent >= limit_percent
+        return {
+            "blocked": blocked,
+            "reason": "machine_credit_limit_reached" if blocked else "within_machine_credit_limit",
+            "mode": "official", "used_account_percent": round(used_percent, 6),
+            "limit_account_percent": round(limit_percent, 6),
+            "remaining_account_percent": round(max(limit_percent - used_percent, 0), 6),
+            "official_used_percent": quota["used_percent"],
+            "period_start": quota["period_start"], "period_end": quota["period_end"],
+            "hard_cap_enabled": True,
+        }
     if not control["start_date"] or not control["end_date"] or control["budget_credits"] is None:
-        return {"blocked": False, "reason": "hard_cap_not_configured"}
-    data = summary(
-        path, start_date=str(control["start_date"]), end_date=str(control["end_date"])
-    )
+        return {"blocked": False, "reason": "manual_budget_incomplete", "mode": "manual"}
+    data = summary(path, start_date=str(control["start_date"]), end_date=str(control["end_date"]))
     machine = next((item for item in data["machines"] if item["machine_id"] == machine_id), None)
     used = float(machine["estimated_credits"]) if machine else 0.0
     target = float(data["per_machine_target"] or 0)
@@ -945,6 +997,7 @@ def machine_policy(path: Path, machine_id: str) -> dict[str, object]:
     return {
         "blocked": blocked,
         "reason": "machine_credit_limit_reached" if blocked else "within_machine_credit_limit",
+        "mode": "manual",
         "used_credits": round(used, 6), "limit_credits": round(target, 6),
         "remaining_credits": round(max(target - used, 0), 6),
         "period_start": control["start_date"], "period_end": control["end_date"],
@@ -975,13 +1028,13 @@ def dashboard_page(
         "settings": lambda: _settings_page(data, session, role, days, secret),
     }[page]()
     page_names = {
-        "overview": "总览", "machines": "机器", "models": "模型",
+        "overview": "总览", "machines": "设备额度", "models": "计费明细",
         "machine": "机器详情", "settings": "设置",
     }
     primary = [
         ("overview", "/dashboard", "总览"),
-        ("machines", "/dashboard/machines", "机器"),
-        ("models", "/dashboard/models", "模型"),
+        ("machines", "/dashboard/machines", "设备额度"),
+        ("models", "/dashboard/models", "计费明细"),
         ("settings", "/dashboard/settings", "设置"),
     ]
     scope = urlencode({"start": data["start_date"], "end": data["end_date"]})
@@ -1098,14 +1151,19 @@ def _machine_total_chart(data: dict[str, object]) -> str:
             advice, css = "已到均分上限", "limit"
         elif item["allocation_status"] == "reduce":
             advice, css = "接近上限，建议少用", "reduce"
+        elif data["allocation_mode"] == "official" and item["account_quota_percent"] is not None:
+            remaining = max(float(data["per_machine_target_percent"]) - float(item["account_quota_percent"]), 0)
+            advice, css = f'估算占账户 {item["account_quota_percent"]:.2f}% · 还可 {remaining:.2f}%', "available"
         else:
-            advice, css = f'还可使用 {_credits(item["budget_remaining"])}', "available"
+            advice, css = f'还可使用 {_credits(item["budget_remaining"])} Credits', "available"
         rows.append(f'''<div class="total-row"><div><strong>{html.escape(item['machine_name'])}</strong><span class="advice {css}">{advice}</span></div>
 <div class="total-bar"><i style="width:{width:.1f}%"></i></div><b>{_credits(item['estimated_credits'])}</b></div>''')
-    target_note = (
-        f'<p class="target-note">{data["machine_slots"]} 等分目标：每台 {_credits(target)} Credits</p>'
-        if target is not None else '<p class="target-note">等待官方使用比例或管理员预算后生成均衡建议</p>'
-    )
+    if data["allocation_mode"] == "official" and data["per_machine_target_percent"] is not None:
+        target_note = f'<p class="target-note">官方窗口自动 {data["machine_slots"]} 等分：每台最多占账户总额度 {data["per_machine_target_percent"]:.2f}%（按已记录用量比例估算）</p>'
+    elif target is not None:
+        target_note = f'<p class="target-note">手动预算 {data["machine_slots"]} 等分：每台 {_credits(target)} Credits</p>'
+    else:
+        target_note = '<p class="target-note">等待官方 Usage 快照或完整的手动预算设置</p>'
     return f'<div class="total-chart">{"".join(rows)}{target_note}</div>'
 
 
@@ -1130,12 +1188,19 @@ def _machines_page(data: dict[str, object], days: int) -> str:
         link = "/dashboard/machine?" + urlencode({"id": item["machine_id"], "start": data["start_date"], "end": data["end_date"]})
         top_names = list(dict.fromkeys(model["model"] for model in item["models"]))[:3]
         top = "、".join(html.escape(model) for model in top_names)
+        status = {"limit": "已到上限", "reduce": "接近上限", "available": "可继续使用"}.get(item["allocation_status"], "待计算")
+        allocation = (
+            f'{item["account_quota_percent"]:.2f}% / {data["per_machine_target_percent"]:.2f}%'
+            if data["allocation_mode"] == "official" and item["account_quota_percent"] is not None
+            else f'{_credits(item["estimated_credits"])} / {_credits(data["per_machine_target"])} Credits'
+            if data["per_machine_target"] is not None else "—"
+        )
         rows.append(f"""<tr><td><a class="name" href="{link}">{html.escape(item['machine_name'])}</a><small>{html.escape(item['machine_id'])}</small></td>
-<td>{_number(item['requests'])}</td><td>{_number(item['input_tokens'])}</td><td>{_number(item['cached_input_tokens'])}</td><td>{item['cache_hit_rate']:.1f}%</td>
-<td>{_number(item['output_tokens'])}</td><td>{_credits(item['estimated_credits'])}</td><td class="mix">{top}</td></tr>""")
-    return f"""{_cards(data['totals'])}<section class="panel"><div class="panel-head"><div><h2>机器统计</h2><p>点击机器名称查看每日记录和模型组合。</p></div></div>
-<div class="table-wrap"><table><thead><tr><th>机器</th><th>请求</th><th>输入</th><th>缓存输入</th><th>缓存率</th><th>输出</th><th>Credits</th><th>主要模型</th></tr></thead>
-<tbody>{''.join(rows) or '<tr><td colspan="8" class="empty">尚无机器数据</td></tr>'}</tbody></table></div></section>"""
+<td><span class="advice {item['allocation_status']}">{status}</span></td><td>{allocation}</td><td>{_credits(item['estimated_credits'])}</td>
+<td>{_number(item['requests'])}</td><td>{item['cache_hit_rate']:.1f}%</td><td class="mix">{top}</td><td>{html.escape(_short_time(item['last_seen']))}</td></tr>""")
+    return f"""{_cards(data['totals'])}<section class="panel"><div class="panel-head"><div><h2>设备额度</h2><p>用于判断哪台设备可以多用、哪台应减量；点击名称查看用量组成。</p></div></div>
+<div class="table-wrap"><table><thead><tr><th>设备</th><th>状态</th><th>已用 / 均分上限</th><th>Credits</th><th>请求</th><th>缓存率</th><th>主要模型</th><th>最后使用</th></tr></thead>
+<tbody>{''.join(rows) or '<tr><td colspan="8" class="empty">尚无设备数据</td></tr>'}</tbody></table></div></section>"""
 
 
 def _models_page(data: dict[str, object]) -> str:
@@ -1149,7 +1214,7 @@ def _models_page(data: dict[str, object]) -> str:
 <td>{html.escape(_tier_label(item['service_tier']))}</td><td>{item['speed_multiplier']:g}×</td><td>{_number(item['requests'])}</td>
 <td>{_number(item['input_tokens'])}</td><td>{_number(item['cached_input_tokens'])}</td><td>{_number(item['output_tokens'])}</td>
 <td>{_number(item['reasoning_output_tokens'])}</td><td>{_credits(item['estimated_credits']) if not item['unrated'] else '未定价'}</td><td>{share:.1f}%</td><td>{rate_text}</td></tr>""")
-    return f"""{_cards(data['totals'])}<section class="panel"><div class="panel-head"><div><h2>模型与档位</h2><p>推理档位影响实际输出量；Fast 档位按官方倍数提高标准 Credits。</p></div></div>
+    return f"""{_cards(data['totals'])}<section class="panel"><div class="panel-head"><div><h2>计费明细</h2><p>用于核对 Credits 为什么增加，以及费率、推理档位和 Fast 倍数是否正确；未定价模型会在页面顶部报警。</p></div></div>
 <div class="table-wrap"><table><thead><tr><th>模型</th><th>推理</th><th>速度</th><th>倍数</th><th>请求</th><th>输入</th><th>缓存</th><th>输出</th><th>推理输出</th><th>Credits</th><th>占比</th><th>标准费率 输入/缓存/输出</th></tr></thead>
 <tbody>{''.join(rows) or '<tr><td colspan="12" class="empty">尚无模型数据</td></tr>'}</tbody></table></div></section>"""
 
@@ -1185,8 +1250,15 @@ def _settings_page(data: dict[str, object], session: str, role: str, days: int, 
     control = data["control"]
     budget = "" if control["budget_credits"] is None else str(control["budget_credits"])
     hard_checked = " checked" if control["hard_cap"] else ""
+    official_checked = " checked" if control["mode"] == "official" else ""
+    manual_checked = " checked" if control["mode"] == "manual" else ""
     control_start = control["start_date"] or data["start_date"]
     control_end = control["end_date"] or data["end_date"]
+    quota = data.get("quota")
+    official_status = (
+        f'当前官方窗口：{html.escape(quota["period_start"])} 至 {html.escape(quota["period_end"])}，已用 {quota["used_percent"]:g}%，剩余 {quota["remaining_percent"]:g}%。'
+        if quota else "尚未收到官方 Usage 快照；选择后会等待 Bridge 自动同步。"
+    )
     rows = []
     seen = set()
     for item in data["models"]:
@@ -1202,20 +1274,23 @@ def _settings_page(data: dict[str, object], session: str, role: str, days: int, 
 <label>输入<input type="number" name="input_rate" min="0" max="100000" step="0.001" value="{rates[0]}"></label>
 <label>缓存<input type="number" name="cached_rate" min="0" max="100000" step="0.001" value="{rates[1]}"></label>
 <label>输出<input type="number" name="output_rate" min="0" max="100000" step="0.001" value="{rates[2]}"></label><button>保存</button></form></td></tr>""")
-    return f"""<section class="panel"><div class="panel-head"><div><h2>统计周期与六等分控制</h2><p>明确设置起止日期和总 Credits 后，可选择在单机达到均分上限时阻止其后续 Codex 模型请求。</p></div></div>
+    return f"""<section class="panel"><div class="panel-head"><div><h2>额度分配模式</h2><p>两种模式互斥：使用官方当前窗口自动分配，或者完全使用你填写的周期和预算。</p></div></div>
 <form class="control-form" method="post" action="/dashboard/control"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="days" value="{days}">
-<label>开始日期<input type="date" name="start_date" value="{html.escape(str(control_start))}" required></label>
-<label>结束日期<input type="date" name="end_date" value="{html.escape(str(control_end))}" required></label>
-<label>周期总 Credits<input type="number" name="budget" min="0.000001" step="0.01" placeholder="例如 1200" value="{budget}"></label>
+<div class="mode-options"><label class="mode-card"><input type="radio" name="control_mode" value="official"{official_checked}><strong>官方额度自动六等分</strong><span>自动采用官方窗口起止时间；根据官方已用比例和各设备已记录 Credits 占比估算设备额度。</span></label>
+<label class="mode-card"><input type="radio" name="control_mode" value="manual"{manual_checked}><strong>手动周期与预算</strong><span>使用你填写的日期和总 Credits，不依赖官方 Usage 快照。</span></label></div>
+<div class="official-mode"><strong>官方模式状态</strong><p>{official_status}</p></div>
+<div class="manual-fields"><label>开始日期<input type="date" name="start_date" value="{html.escape(str(control_start))}"></label>
+<label>结束日期<input type="date" name="end_date" value="{html.escape(str(control_end))}"></label>
+<label>周期总 Credits<input type="number" name="budget" min="0.000001" step="0.01" placeholder="例如 1200" value="{budget}"></label></div>
 <label>均分设备数<input type="number" name="machine_slots" min="1" max="100" step="1" value="{control['machine_slots']}" required></label>
 <label class="check"><input type="checkbox" name="hard_cap"{hard_checked}> 达到均分上限后自动禁用该机模型请求</label><button>保存控制设置</button></form>
-<p class="safety-note">硬上限必须有明确预算才可开启；中央服务不可达时客户端沿用最近策略，不会因网络故障误停。</p></section>
+<p class="safety-note">官方模式的单机占比是根据 Bridge 已记录用量估算的；快照过期或记录不足时自动放行。手动模式按明确 Credits 硬上限执行。中央服务不可达时客户端沿用最近策略。</p></section>
 <section class="panel"><div class="panel-head"><div><h2>标准模型费率</h2><p>单位：每 100 万 Token 的 Credits。Fast 倍数由系统在标准费率之外自动应用。</p></div></div>
 <div class="table-wrap"><table><thead><tr><th>模型</th><th>输入 / 缓存 / 输出</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="2" class="empty">收到模型数据后可修改费率</td></tr>'}</tbody></table></div></section>"""
 
 
 def _cards(total: dict[str, object]) -> str:
-    return f"""<section class="cards"><article><span>机器</span><strong>{_number(total['machines'])}</strong></article>
+    return f"""<section class="cards"><article><span>设备</span><strong>{_number(total['machines'])}</strong></article>
 <article><span>请求</span><strong>{_number(total['requests'])}</strong></article>
 <article><span>原始 Token</span><strong>{_number(total['total_tokens'])}</strong></article>
 <article><span>估算 Credits</span><strong>{_credits(total['estimated_credits'])}</strong></article></section>"""
@@ -1260,11 +1335,12 @@ main{max-width:1440px;margin:auto;padding:22px}.toolbar{display:flex;justify-con
 .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.cards article,.panel{background:white;border:1px solid #e0e7f1;border-radius:14px;box-shadow:0 5px 22px #19345d0b}.cards article{padding:18px}.cards span{display:block;color:#718096}.cards strong{display:block;font-size:27px;margin-top:7px}.panel{margin-top:18px;overflow:hidden}.split{display:grid;grid-template-columns:1.35fr 1fr;gap:18px}.split .panel{min-width:0}.panel-head{display:flex;justify-content:space-between;gap:18px;align-items:center;padding:20px}.panel-head p,.title-row p{color:#718096;margin-top:5px}.title-row{padding:8px 2px 2px}.title-row h2{font-size:26px}.back{margin:2px 0 14px}.back a{text-decoration:none}
 .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap}th,td{text-align:left;padding:13px 15px;border-top:1px solid #edf1f7}th{font-size:12px;color:#718096;background:#fafcff}td small{display:block;color:#98a5b7;margin-top:3px}.name{font-weight:700;text-decoration:none}.mix{white-space:normal;min-width:180px;color:#52647b;font-size:13px}
 .bar{display:inline-block;width:90px;height:7px;background:#e8eef8;border-radius:6px;margin-right:9px;vertical-align:middle}.bar i{display:block;height:100%;background:#2d6cdf;border-radius:6px}.over{color:#c53030}.under{color:#2b6cb0}.balanced{color:#218358}.notice{background:#fff8e6;border:1px solid #f4d48c;color:#7c5700;padding:11px 14px;border-radius:10px;margin-bottom:15px}
-.dashboard-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:18px}.chart-panel,.total-panel{margin-top:0}.line-chart{padding:0 18px 18px}.line-chart svg{display:block;width:100%;height:auto;min-height:260px}.line-chart text{font-size:11px;fill:#718096}.gridline{stroke:#e6edf7;stroke-width:1}.legend{display:flex;flex-wrap:wrap;gap:10px 18px;justify-content:center}.legend span{font-size:12px;color:#52647b}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.quota-strip{display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:28px;background:#eaf2ff;border:1px solid #c9dcff;border-radius:14px;padding:14px 18px;margin-bottom:18px}.quota-strip span{display:block;font-size:11px;color:#64748b}.quota-strip strong{display:block;margin-top:3px}.quota-strip p{text-align:right;color:#52647b;font-size:12px}.quota-strip.muted{display:block;color:#718096}.total-chart{padding:0 20px 18px}.total-row{display:grid;grid-template-columns:minmax(120px,1.25fr) minmax(70px,1fr) auto;align-items:center;gap:10px;padding:11px 0;border-top:1px solid #edf1f7}.total-row strong{display:block;font-size:13px}.total-row b{font-size:13px}.total-bar{height:8px;background:#e8eef8;border-radius:8px}.total-bar i{display:block;height:100%;background:linear-gradient(90deg,#2463eb,#5b8def);border-radius:8px}.advice{display:block;font-size:10px;margin-top:3px}.advice.limit{color:#c53030}.advice.reduce{color:#b7791f}.advice.available{color:#218358}.advice.neutral{color:#718096}.target-note{font-size:12px;color:#52647b;background:#f7f9fc;padding:10px;border-radius:8px;margin-top:8px}.control-form{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:12px;padding:0 20px 18px;align-items:end}.control-form label{font-size:11px;color:#718096}.control-form input{display:block;width:100%;margin-top:4px}.control-form .check{grid-column:1/4;display:flex;align-items:center;gap:8px;font-size:13px;color:#52647b}.control-form .check input{width:auto;margin:0}.safety-note{margin:0 20px 20px;color:#8a5b00;background:#fff8e6;padding:10px;border-radius:8px;font-size:12px}
-button{border:0;border-radius:8px;background:#2463eb;color:white;padding:9px 14px;font-weight:600;cursor:pointer}input{border:1px solid #ccd6e5;border-radius:8px;padding:9px;background:white}.inline,.budget{display:flex;gap:7px}.rates label{font-size:11px;color:#718096}.rates input{display:block;width:78px;padding:6px}.budget input{width:250px}.empty{text-align:center;color:#718096;padding:32px}.foot{text-align:center;color:#718096;padding:26px;font-size:13px}
+.dashboard-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:18px}.chart-panel,.total-panel{margin-top:0}.line-chart{padding:0 18px 18px}.line-chart svg{display:block;width:100%;height:auto;min-height:260px}.line-chart text{font-size:11px;fill:#718096}.gridline{stroke:#e6edf7;stroke-width:1}.legend{display:flex;flex-wrap:wrap;gap:10px 18px;justify-content:center}.legend span{font-size:12px;color:#52647b}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.quota-strip{display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:28px;background:#eaf2ff;border:1px solid #c9dcff;border-radius:14px;padding:14px 18px;margin-bottom:18px}.quota-strip span{display:block;font-size:11px;color:#64748b}.quota-strip strong{display:block;margin-top:3px}.quota-strip p{text-align:right;color:#52647b;font-size:12px}.quota-strip.muted{display:block;color:#718096}.total-chart{padding:0 20px 18px}.total-row{display:grid;grid-template-columns:minmax(120px,1.25fr) minmax(70px,1fr) auto;align-items:center;gap:10px;padding:11px 0;border-top:1px solid #edf1f7}.total-row strong{display:block;font-size:13px}.total-row b{font-size:13px}.total-bar{height:8px;background:#e8eef8;border-radius:8px}.total-bar i{display:block;height:100%;background:linear-gradient(90deg,#2463eb,#5b8def);border-radius:8px}.advice{display:block;font-size:10px;margin-top:3px}.advice.limit{color:#c53030}.advice.reduce{color:#b7791f}.advice.available{color:#218358}.advice.neutral{color:#718096}.target-note{font-size:12px;color:#52647b;background:#f7f9fc;padding:10px;border-radius:8px;margin-top:8px}.control-form{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:12px;padding:0 20px 18px;align-items:end}.control-form label{font-size:11px;color:#718096}.control-form input{display:block;width:100%;margin-top:4px}.mode-options{grid-column:1/5;display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode-card{position:relative;padding:15px 15px 15px 44px;border:1px solid #dbe4f0;border-radius:12px;background:#f9fbfe;cursor:pointer}.mode-card input{position:absolute;left:15px;top:16px;width:auto;margin:0}.mode-card strong,.mode-card span{display:block}.mode-card strong{font-size:14px;color:#253858}.mode-card span{font-size:12px;line-height:1.55;margin-top:5px}.mode-card:has(input:checked){border-color:#2463eb;background:#eef4ff;box-shadow:0 0 0 1px #2463eb}.official-mode{grid-column:1/5;padding:11px 13px;border-radius:9px;background:#f1f6ff;color:#52647b}.official-mode strong{font-size:12px}.official-mode p{font-size:12px;margin-top:4px}.manual-fields{grid-column:1/5;display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.manual-fields label{display:block}.control-form .check{grid-column:1/4;display:flex;align-items:center;gap:8px;font-size:13px;color:#52647b}.control-form .check input{width:auto;margin:0}.safety-note{margin:0 20px 20px;color:#8a5b00;background:#fff8e6;padding:10px;border-radius:8px;font-size:12px}
+.control-form:has(input[value="official"]:checked) .manual-fields{opacity:.42}.control-form:has(input[value="manual"]:checked) .official-mode{opacity:.42}
+ button{border:0;border-radius:8px;background:#2463eb;color:white;padding:9px 14px;font-weight:600;cursor:pointer}input{border:1px solid #ccd6e5;border-radius:8px;padding:9px;background:white}.inline,.budget{display:flex;gap:7px}.rates label{font-size:11px;color:#718096}.rates input{display:block;width:78px;padding:6px}.budget input{width:250px}.empty{text-align:center;color:#718096;padding:32px}.foot{text-align:center;color:#718096;padding:26px;font-size:13px}
 .login-body{min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#edf4ff,#f8fbff)}.login-card{width:min(390px,92vw);padding:30px;background:white;border-radius:18px;box-shadow:0 18px 60px #18375d22}.login-card .muted{color:#718096;margin:8px 0 22px}.login-card label{display:block;margin:14px 0;color:#52647b}.login-card input{display:block;width:100%;margin-top:6px}.login-card button{width:100%;margin-top:8px}.error{color:#c53030;background:#fff5f5;padding:10px;border-radius:8px}
-@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.split,.dashboard-grid{grid-template-columns:1fr}.panel-head{align-items:flex-start;flex-direction:column}.budget{width:100%}.budget input{flex:1}main{padding:14px}.toolbar{align-items:flex-start;flex-direction:column}.date-filter{width:100%;overflow:auto}.quota-strip{grid-template-columns:1fr 1fr}.quota-strip p{grid-column:1/3;text-align:left}.control-form{grid-template-columns:repeat(2,1fr)}.control-form .check{grid-column:1/3}}
-@media(max-width:520px){header{align-items:flex-start;flex-direction:column;padding:18px 24px}.identity{justify-content:flex-end;margin-top:12px;width:100%}.date-filter label{min-width:130px}.quota-strip{grid-template-columns:1fr}.quota-strip p{grid-column:auto}.control-form{grid-template-columns:1fr}.control-form .check{grid-column:auto}.line-chart{overflow:auto}.line-chart svg{min-width:620px}.total-row{grid-template-columns:1fr auto}.total-bar{grid-column:1/3}}
+@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.split,.dashboard-grid{grid-template-columns:1fr}.panel-head{align-items:flex-start;flex-direction:column}.budget{width:100%}.budget input{flex:1}main{padding:14px}.toolbar{align-items:flex-start;flex-direction:column}.date-filter{width:100%;overflow:auto}.quota-strip{grid-template-columns:1fr 1fr}.quota-strip p{grid-column:1/3;text-align:left}.control-form{grid-template-columns:repeat(2,1fr)}.mode-options,.official-mode,.manual-fields{grid-column:1/3}.control-form .check{grid-column:1/3}}
+@media(max-width:520px){header{align-items:flex-start;flex-direction:column;padding:18px 24px}.identity{justify-content:flex-end;margin-top:12px;width:100%}.date-filter label{min-width:130px}.quota-strip{grid-template-columns:1fr}.quota-strip p{grid-column:auto}.control-form{grid-template-columns:1fr}.mode-options,.official-mode,.manual-fields,.control-form .check{grid-column:auto}.mode-options,.manual-fields{grid-template-columns:1fr}.line-chart{overflow:auto}.line-chart svg{min-width:620px}.total-row{grid-template-columns:1fr auto}.total-bar{grid-column:1/3}}
 """
 
 
