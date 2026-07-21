@@ -1175,36 +1175,34 @@ def dashboard_page(
 
 
 def _overview_page(data: dict[str, object], days: int) -> str:
-    quota = data.get("quota")
-    if quota:
-        stale = " · 数据超过 20 分钟未更新" if quota["stale"] else ""
-        inferred = (
-            f' · 推算本次可分配 {_credits(data["inferred_budget_credits"])} Credits'
-            if data["inferred_budget_credits"] is not None else ""
-        )
-        baseline = data.get("official_baseline")
-        baseline_html = (
-            f'<div><span>本轮统计基线</span><strong>{html.escape(_short_time(baseline["observed_at"]))} · 可分配 {baseline["remaining_percent"]:g}%</strong></div>'
-            if baseline else ""
-        )
-        quota_html = f'''<section class="quota-strip"><div><span>官方当前窗口</span><strong>已用 {quota['used_percent']:g}% · 剩余 {quota['remaining_percent']:g}%</strong></div>
-<div><span>重置时间</span><strong>{html.escape(_short_time(quota['reset_at']))}</strong></div>{baseline_html}<p>{html.escape(quota['plan_type'])}{inferred}{stale}</p></section>'''
-    else:
-        quota_html = '<section class="quota-strip muted"><div><strong>等待任一 Bridge 同步官方 Usage 快照</strong></div></section>'
-    line_chart = _machine_line_chart(data)
-    total_chart = _machine_total_chart(data)
+    allocation_progress = None
     if data["allocation_mode"] == "official" and data.get("official_baseline"):
         available = float(data["official_baseline"]["remaining_percent"] or 0)
         used = float(data.get("official_incremental_used_percent") or 0)
         allocation_progress = used / available * 100 if available else 0
-        allocation_summary = f'基线后已使用可分配额度的 {allocation_progress:.2f}%'
     elif data["allocation_mode"] in {"manual", "legacy"} and data.get("allocation_budget_credits"):
         allocation_progress = float(data["totals"]["estimated_credits"]) / float(data["allocation_budget_credits"]) * 100
-        allocation_summary = f'已使用本期预算的 {allocation_progress:.2f}%'
+    quota = data.get("quota")
+    if quota:
+        stale = " · 数据超过 20 分钟未更新" if quota["stale"] else ""
+        baseline = data.get("official_baseline")
+        baseline_html = (
+            f'<div><span>本轮统计起点</span><strong>{html.escape(_short_time(baseline["observed_at"]))}</strong><small>当时剩余 {baseline["remaining_percent"]:g}%</small></div>'
+            if baseline else ""
+        )
+        progress_html = (
+            f'<div><span>本轮总体进度</span><strong>{allocation_progress:.2f}%</strong><small>已消耗 {data["official_incremental_used_percent"]:g} / 可分配 {baseline["remaining_percent"]:g} 个百分点</small></div>'
+            if baseline and allocation_progress is not None else ""
+        )
+        stale_html = f'<p>{html.escape(stale.removeprefix(" · "))}</p>' if stale else ""
+        quota_html = f'''<section class="quota-strip"><div><span>官方当前窗口 · {html.escape(quota['plan_type'])}</span><strong>已用 {quota['used_percent']:g}% · 剩余 {quota['remaining_percent']:g}%</strong></div>
+{baseline_html}{progress_html}<div><span>额度重置</span><strong>{html.escape(_short_time(quota['reset_at']))}</strong></div>{stale_html}</section>'''
     else:
-        allocation_summary = "等待额度基准"
+        quota_html = '<section class="quota-strip muted"><div><strong>等待任一 Bridge 同步官方 Usage 快照</strong></div></section>'
+    line_chart = _machine_line_chart(data)
+    total_chart = _machine_total_chart(data)
     return f"""{quota_html}<section class="dashboard-grid"><article class="panel chart-panel"><div class="panel-head"><div><h2>每日 Credits</h2><p>每条曲线代表一台设备</p></div></div>{line_chart}</article>
-<article class="panel total-panel"><div class="panel-head"><div><h2>设备额度进度</h2><p>{allocation_summary} · 每行显示本机均分额度使用率</p></div></div>{total_chart}</article></section>"""
+<article class="panel total-panel"><div class="panel-head"><div><h2>各设备额度使用率</h2><p>相对于每台设备的均分上限；100% 表示本机份额已用完</p></div></div>{total_chart}</article></section>"""
 
 
 def _machine_line_chart(data: dict[str, object]) -> str:
@@ -1274,24 +1272,14 @@ def _machine_total_chart(data: dict[str, object]) -> str:
         if data["allocation_mode"] == "official" and item["account_quota_percent"] is not None:
             used = float(item["account_quota_percent"])
             limit = float(data["per_machine_target_percent"])
-            remaining = max(float(data["per_machine_target_percent"]) - float(item["account_quota_percent"]), 0)
-            over = max(used - limit, 0)
-            advice = (
-                f'已用 {used:.2f}% · 超出 {over:.2f}%'
-                if over else f'已用 {used:.2f}% · 剩余 {remaining:.2f}%'
-            )
+            advice = f'占账号总额度 {used:.2f}% · 本机上限 {limit:.2f}%'
             usage_percent = used / limit * 100 if limit else 0
             progress = min(usage_percent, 100)
             bar_title = f"已用账户总额度 {used:.2f}%，本机均分上限 {limit:.2f}%"
         elif data["allocation_mode"] in {"manual", "legacy"} and target is not None:
             used = float(item["estimated_credits"])
             limit = float(target)
-            remaining = max(limit - used, 0)
-            over = max(used - limit, 0)
-            advice = (
-                f'已用 {_credits(used)} · 超出 {_credits(over)} Credits'
-                if over else f'已用 {_credits(used)} · 剩余 {_credits(remaining)} Credits'
-            )
+            advice = f'已用 {_credits(used)} Credits · 本机上限 {_credits(limit)} Credits'
             usage_percent = used / limit * 100 if limit else 0
             progress = min(usage_percent, 100)
             bar_title = f"已用 {_credits(used)} Credits，本机均分上限 {_credits(limit)} Credits"
@@ -1304,13 +1292,13 @@ def _machine_total_chart(data: dict[str, object]) -> str:
 <div class="total-bar {css}" title="{html.escape(bar_title, quote=True)}"><i class="used" style="width:{progress:.1f}%"></i><i class="remaining" style="width:{remaining_width:.1f}%"></i></div><b class="progress-value">{progress_label}</b></div>''')
     if data["allocation_mode"] == "official" and data["per_machine_target_percent"] is not None:
         baseline_remaining = data["official_baseline"]["remaining_percent"]
-        target_note = f'<p class="target-note">统计开始时官方剩余 {baseline_remaining:g}%，按 {data["machine_slots"]} 台等分：每台可用账户总额度 {data["per_machine_target_percent"]:.2f}%（部署前消耗不参与）</p>'
+        target_note = f'<p class="target-note">本轮可分配 {baseline_remaining:g}%，按 {data["machine_slots"]} 台均分；每台上限为账号总额度的 {data["per_machine_target_percent"]:.2f}%</p>'
     elif target is not None:
         target_note = f'<p class="target-note">手动预算 {data["machine_slots"]} 等分：每台 {_credits(target)} Credits</p>'
     else:
         target_note = '<p class="target-note">等待官方 Usage 快照或完整的手动预算设置</p>'
     has_limit = target is not None or data.get("per_machine_target_percent") is not None
-    legend = '<div class="quota-legend"><span><i class="used"></i>已用</span><span><i class="remaining"></i>剩余至本机均分上限</span></div>' if has_limit else ""
+    legend = '<div class="quota-legend"><span><i class="used"></i>已用份额</span><span><i class="remaining"></i>剩余份额</span></div>' if has_limit else ""
     return f'<div class="total-chart">{legend}{"".join(rows)}{target_note}</div>'
 
 
@@ -1490,7 +1478,7 @@ main{max-width:1440px;margin:auto;padding:22px}.toolbar{display:flex;justify-con
 .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.cards article,.panel{background:white;border:1px solid #e0e7f1;border-radius:14px;box-shadow:0 5px 22px #19345d0b}.cards article{padding:18px}.cards span{display:block;color:#718096}.cards strong{display:block;font-size:27px;margin-top:7px}.panel{margin-top:18px;overflow:hidden}.split{display:grid;grid-template-columns:1.35fr 1fr;gap:18px}.split .panel{min-width:0}.panel-head{display:flex;justify-content:space-between;gap:18px;align-items:center;padding:20px}.panel-head p,.title-row p{color:#718096;margin-top:5px}.title-row{padding:8px 2px 2px}.title-row h2{font-size:26px}.back{margin:2px 0 14px}.back a{text-decoration:none}
 .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;white-space:nowrap}th,td{text-align:left;padding:13px 15px;border-top:1px solid #edf1f7}th{font-size:12px;color:#718096;background:#fafcff}td small{display:block;color:#98a5b7;margin-top:3px}.name{font-weight:700;text-decoration:none}.mix{white-space:normal;min-width:180px;color:#52647b;font-size:13px}
 .bar{display:inline-block;width:90px;height:7px;background:#e8eef8;border-radius:6px;margin-right:9px;vertical-align:middle}.bar i{display:block;height:100%;background:#2d6cdf;border-radius:6px}.over{color:#c53030}.under{color:#2b6cb0}.balanced{color:#218358}.notice{background:#fff8e6;border:1px solid #f4d48c;color:#7c5700;padding:11px 14px;border-radius:10px;margin-bottom:15px}
-.dashboard-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:18px}.chart-panel,.total-panel{margin-top:0}.line-chart{padding:0 18px 18px}.line-chart svg{display:block;width:100%;height:auto;min-height:260px}.line-chart text{font-size:11px;fill:#718096}.gridline{stroke:#e6edf7;stroke-width:1}.legend{display:flex;flex-wrap:wrap;gap:10px 18px;justify-content:center}.legend span{font-size:12px;color:#52647b}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.quota-strip{display:grid;grid-template-columns:auto auto auto 1fr;align-items:center;gap:28px;background:#eaf2ff;border:1px solid #c9dcff;border-radius:14px;padding:14px 18px;margin-bottom:18px}.quota-strip span{display:block;font-size:11px;color:#64748b}.quota-strip strong{display:block;margin-top:3px}.quota-strip p{text-align:right;color:#52647b;font-size:12px}.quota-strip.muted{display:block;color:#718096}.total-chart{padding:0 20px 18px}.total-row{display:grid;grid-template-columns:minmax(120px,1.25fr) minmax(70px,1fr) 58px;align-items:center;gap:10px;padding:11px 0;border-top:1px solid #edf1f7}.total-row strong{display:block;font-size:13px}.total-row b{font-size:13px}.progress-value{text-align:right;font-variant-numeric:tabular-nums;color:#253858}.total-bar{height:8px;background:#e8eef8;border-radius:8px}.total-bar i{display:block;height:100%;background:linear-gradient(90deg,#2463eb,#5b8def);border-radius:8px}.advice{display:block;font-size:10px;margin-top:3px}.advice.limit{color:#c53030}.advice.reduce{color:#b7791f}.advice.available{color:#218358}.advice.neutral{color:#718096}.target-note{font-size:12px;color:#52647b;background:#f7f9fc;padding:10px;border-radius:8px;margin-top:8px}.control-form{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:12px;padding:0 20px 18px;align-items:end}.control-form label{font-size:11px;color:#718096}.control-form input{display:block;width:100%;margin-top:4px}.mode-options{grid-column:1/5;display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode-card{position:relative;padding:15px 15px 15px 44px;border:1px solid #dbe4f0;border-radius:12px;background:#f9fbfe;cursor:pointer}.mode-card input{position:absolute;left:15px;top:16px;width:auto;margin:0}.mode-card strong,.mode-card span{display:block}.mode-card strong{font-size:14px;color:#253858}.mode-card span{font-size:12px;line-height:1.55;margin-top:5px}.mode-card:has(input:checked){border-color:#2463eb;background:#eef4ff;box-shadow:0 0 0 1px #2463eb}.official-mode{grid-column:1/5;padding:11px 13px;border-radius:9px;background:#f1f6ff;color:#52647b}.official-mode strong{font-size:12px}.official-mode p{font-size:12px;margin-top:4px}.manual-fields{grid-column:1/5;display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.manual-fields label{display:block}.control-form .check{grid-column:1/4;display:flex;align-items:center;gap:8px;font-size:13px;color:#52647b}.control-form .check input{width:auto;margin:0}.safety-note{margin:0 20px 20px;color:#8a5b00;background:#fff8e6;padding:10px;border-radius:8px;font-size:12px}
+.dashboard-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:18px}.chart-panel,.total-panel{margin-top:0}.line-chart{padding:0 18px 18px}.line-chart svg{display:block;width:100%;height:auto;min-height:260px}.line-chart text{font-size:11px;fill:#718096}.gridline{stroke:#e6edf7;stroke-width:1}.legend{display:flex;flex-wrap:wrap;gap:10px 18px;justify-content:center}.legend span{font-size:12px;color:#52647b}.legend i{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}.quota-strip{display:grid;grid-template-columns:auto auto auto 1fr;align-items:center;gap:28px;background:#eaf2ff;border:1px solid #c9dcff;border-radius:14px;padding:14px 18px;margin-bottom:18px}.quota-strip span{display:block;font-size:11px;color:#64748b}.quota-strip strong{display:block;margin-top:3px}.quota-strip small{display:block;margin-top:3px;color:#64748b;font-size:10px}.quota-strip p{grid-column:1/-1;color:#8a5b00;font-size:11px}.quota-strip.muted{display:block;color:#718096}.total-chart{padding:0 20px 18px}.total-row{display:grid;grid-template-columns:minmax(120px,1.25fr) minmax(70px,1fr) 58px;align-items:center;gap:10px;padding:11px 0;border-top:1px solid #edf1f7}.total-row strong{display:block;font-size:13px}.total-row b{font-size:13px}.progress-value{text-align:right;font-variant-numeric:tabular-nums;color:#253858}.total-bar{height:8px;background:#e8eef8;border-radius:8px}.total-bar i{display:block;height:100%;background:linear-gradient(90deg,#2463eb,#5b8def);border-radius:8px}.advice{display:block;font-size:10px;margin-top:3px}.advice.limit{color:#c53030}.advice.reduce{color:#b7791f}.advice.available{color:#218358}.advice.neutral{color:#718096}.target-note{font-size:12px;color:#52647b;background:#f7f9fc;padding:10px;border-radius:8px;margin-top:8px}.control-form{display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:12px;padding:0 20px 18px;align-items:end}.control-form label{font-size:11px;color:#718096}.control-form input{display:block;width:100%;margin-top:4px}.mode-options{grid-column:1/5;display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode-card{position:relative;padding:15px 15px 15px 44px;border:1px solid #dbe4f0;border-radius:12px;background:#f9fbfe;cursor:pointer}.mode-card input{position:absolute;left:15px;top:16px;width:auto;margin:0}.mode-card strong,.mode-card span{display:block}.mode-card strong{font-size:14px;color:#253858}.mode-card span{font-size:12px;line-height:1.55;margin-top:5px}.mode-card:has(input:checked){border-color:#2463eb;background:#eef4ff;box-shadow:0 0 0 1px #2463eb}.official-mode{grid-column:1/5;padding:11px 13px;border-radius:9px;background:#f1f6ff;color:#52647b}.official-mode strong{font-size:12px}.official-mode p{font-size:12px;margin-top:4px}.manual-fields{grid-column:1/5;display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.manual-fields label{display:block}.control-form .check{grid-column:1/4;display:flex;align-items:center;gap:8px;font-size:13px;color:#52647b}.control-form .check input{width:auto;margin:0}.safety-note{margin:0 20px 20px;color:#8a5b00;background:#fff8e6;padding:10px;border-radius:8px;font-size:12px}
 .control-form:has(input[value="official"]:checked) .manual-fields{opacity:.42}.control-form:has(input[value="manual"]:checked) .official-mode{opacity:.42}
 .total-bar{display:flex;overflow:hidden}.total-bar i{border-radius:0}.total-bar .used{background:linear-gradient(90deg,#2463eb,#5b8def)}.total-bar .remaining{background:#dce7f7}.total-bar.limit .used{background:linear-gradient(90deg,#e05252,#c53030)}.total-bar.reduce .used{background:linear-gradient(90deg,#eab84b,#d69e2e)}.quota-legend{display:flex;gap:16px;justify-content:flex-end;padding:0 0 8px;font-size:11px;color:#718096}.quota-legend i{display:inline-block;width:11px;height:7px;border-radius:4px;margin-right:5px}.quota-legend .used{background:#3974e8}.quota-legend .remaining{background:#dce7f7}
 .baseline-reset{display:flex;align-items:center;gap:8px;margin:-5px 20px 18px;color:#52647b;font-size:12px}.baseline-reset input{width:auto;margin:0}

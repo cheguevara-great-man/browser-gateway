@@ -126,9 +126,11 @@ class CollectorTests(unittest.TestCase):
             overview = MODULE.dashboard_page(
                 result, "session", "admin", 30, b"secret", page="overview"
             )
-            self.assertIn("基线后已使用可分配额度的 25.00%", overview)
+            self.assertIn("本轮总体进度", overview)
+            self.assertIn("25.00%", overview)
             self.assertIn("150.0%", overview)
-            self.assertIn("本轮统计基线", overview)
+            self.assertIn("各设备额度使用率", overview)
+            self.assertIn("本轮统计起点", overview)
             self.assertIn(MODULE._short_time(observed.isoformat()), overview)
             MODULE.set_control_settings(
                 database, mode="official", start_date="", end_date="", budget=None,
@@ -305,7 +307,7 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 page = response.read().decode("utf-8")
                 self.assertIn("每日 Credits", page)
-                self.assertIn("设备额度进度", page)
+                self.assertIn("各设备额度使用率", page)
 
                 connection.request("GET", "/dashboard/daily?days=30", headers={"Cookie": cookie})
                 response = connection.getresponse()
