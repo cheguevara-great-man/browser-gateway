@@ -123,6 +123,13 @@ class CollectorTests(unittest.TestCase):
             self.assertAlmostEqual(
                 result["per_machine_target"], result["inferred_budget_credits"] / 6, places=6
             )
+            overview = MODULE.dashboard_page(
+                result, "session", "admin", 30, b"secret", page="overview"
+            )
+            self.assertIn("基线后已使用可分配额度的 25.00%", overview)
+            self.assertIn("150.0%", overview)
+            self.assertIn("本轮统计基线", overview)
+            self.assertIn(MODULE._short_time(observed.isoformat()), overview)
             MODULE.set_control_settings(
                 database, mode="official", start_date="", end_date="", budget=None,
                 machine_slots=6, hard_cap=True,

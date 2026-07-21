@@ -78,7 +78,7 @@ Bridge 2.7/2.8 已排队事件继续兼容。
 
 ## 网页页面
 
-- `/dashboard`：设备日 Credits 折线图、统计期设备总额、官方已用/剩余比例与公平建议；
+- `/dashboard`：设备日 Credits 折线图、基线后可分配额度总进度、各设备均分额度使用率、官方已用/剩余比例与公平建议；
 - `/dashboard/daily`：兼容旧链接，自动显示新总览；
 - `/dashboard/machines`（设备额度）：比较单机占额、均分上限、状态、Credits 和最后使用时间；
 - `/dashboard/machine?id=<机器ID>`：追查一台设备的模型组合和每日历史；
