@@ -72,7 +72,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\enable-password-ssh.
 
 ## Gemini 使用 WARP 分流
 
-服务器已有 Cloudflare WARP WireGuard endpoint 和 Gemini 规则集时，可以仅让 Gemini 相关请求经过 WARP，其他网站继续使用服务器原生出口。配置方法、链路和验证命令见 [Gemini 的 WARP 分流](docs/GEMINI_WARP.md)。
+服务器已有 Cloudflare WARP WireGuard endpoint，以及 Gemini、Google 规则集时，可以让 Gemini API 和网页所依赖的 Google 服务统一经过 WARP，其他网站继续使用服务器原生出口。配置方法、链路和验证命令见 [Gemini 的 WARP 分流](docs/GEMINI_WARP.md)。
 
 ## 安装 Chrome 扩展
 

@@ -245,15 +245,16 @@ jq -n --argjson port "$POLICY_PORT" --argjson usage_port "$USAGE_PORT" --arg ip 
 # the policy survive normal Browser Gateway upgrades without coupling the base
 # installer to a particular system-wide sing-box setup.
 if [[ -s "$GEMINI_WARP_SETTINGS" ]] && jq -e '.enabled == true' "$GEMINI_WARP_SETTINGS" >/dev/null; then
-  gemini_rule_set_path="$(jq -er '.rule_set_path' "$GEMINI_WARP_SETTINGS")"
-  [[ -s "$gemini_rule_set_path" ]] || fail "Gemini WARP rule-set is missing: $gemini_rule_set_path"
+  while IFS= read -r rule_set_path; do
+    [[ -s "$rule_set_path" ]] || fail "Gemini WARP rule-set is missing: $rule_set_path"
+  done < <(jq -er '.rule_sets[].path' "$GEMINI_WARP_SETTINGS")
   jq --slurpfile warp "$GEMINI_WARP_SETTINGS" '
     ($warp[0]) as $w |
     .outbounds += [{type:"socks",tag:"gemini-warp",server:"127.0.0.1",server_port:$w.proxy_port,version:"5"}] |
-    .route.rule_set = [{type:"local",tag:"gemini-warp-domains",format:"binary",path:$w.rule_set_path}] |
+    .route.rule_set = ($w.rule_sets | map({type:"local",tag:.tag,format:"binary",path:.path})) |
     .route.rules = (
       .route.rules[0:4] +
-      [{rule_set:["gemini-warp-domains"],port:[80,443],action:"route",outbound:"gemini-warp"}] +
+      [{rule_set:($w.rule_sets | map(.tag)),port:[80,443],action:"route",outbound:"gemini-warp"}] +
       .route.rules[4:]
     )
   ' "$CONFIG_ROOT/egress.json.next" > "$CONFIG_ROOT/egress.json.warp"

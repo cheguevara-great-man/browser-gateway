@@ -6,13 +6,15 @@ GLOBAL_ROUTE="$GLOBAL_CONFIG_DIR/route.json"
 GLOBAL_INBOUND="$GLOBAL_CONFIG_DIR/browser-gateway-warp.json"
 GLOBAL_BINARY="${GLOBAL_BINARY:-/etc/sing-box/sing-box}"
 WARP_ENDPOINT_TAG="${WARP_ENDPOINT_TAG:-wireguard-out}"
-WARP_RULE_SET_TAG="${WARP_RULE_SET_TAG:-gemini}"
+GEMINI_RULE_SET_TAG="${GEMINI_RULE_SET_TAG:-gemini}"
+GOOGLE_RULE_SET_TAG="${GOOGLE_RULE_SET_TAG:-google}"
 WARP_PROXY_PORT="${WARP_PROXY_PORT:-18089}"
 GATEWAY_CONFIG_ROOT="${GATEWAY_CONFIG_ROOT:-/etc/browser-gateway}"
 GATEWAY_CONFIG="$GATEWAY_CONFIG_ROOT/egress.json"
 GATEWAY_BINARY="${GATEWAY_BINARY:-/opt/browser-gateway/bin/sing-box}"
 SETTINGS="$GATEWAY_CONFIG_ROOT/gemini-warp.json"
-GATEWAY_RULE_SET="$GATEWAY_CONFIG_ROOT/gemini.srs"
+GEMINI_RULE_SET="$GATEWAY_CONFIG_ROOT/gemini.srs"
+GOOGLE_RULE_SET="$GATEWAY_CONFIG_ROOT/google.srs"
 BACKUP_ROOT="/root/browser-gateway-backups"
 EGRESS_DROPIN_DIR="/etc/systemd/system/browser-gateway-egress.service.d"
 EGRESS_DROPIN="$EGRESS_DROPIN_DIR/gemini-warp.conf"
@@ -34,9 +36,12 @@ for file in "$GLOBAL_CONFIG_DIR"/*.json; do
   fi
 done
 [[ "$endpoint_found" == true ]] || fail "WireGuard endpoint '$WARP_ENDPOINT_TAG' was not found"
-jq -e --arg tag "$WARP_RULE_SET_TAG" '.route.rule_set[]? | select(.tag == $tag)' "$GLOBAL_ROUTE" >/dev/null || \
-  fail "Gemini rule-set '$WARP_RULE_SET_TAG' was not found"
-rule_set_url="$(jq -er --arg tag "$WARP_RULE_SET_TAG" '.route.rule_set[] | select(.tag == $tag) | .url' "$GLOBAL_ROUTE")"
+for tag in "$GEMINI_RULE_SET_TAG" "$GOOGLE_RULE_SET_TAG"; do
+  jq -e --arg tag "$tag" '.route.rule_set[]? | select(.tag == $tag)' "$GLOBAL_ROUTE" >/dev/null || \
+    fail "required rule-set '$tag' was not found"
+done
+gemini_rule_set_url="$(jq -er --arg tag "$GEMINI_RULE_SET_TAG" '.route.rule_set[] | select(.tag == $tag) | .url' "$GLOBAL_ROUTE")"
+google_rule_set_url="$(jq -er --arg tag "$GOOGLE_RULE_SET_TAG" '.route.rule_set[] | select(.tag == $tag) | .url' "$GLOBAL_ROUTE")"
 
 install -d -o root -g root -m 0700 "$BACKUP_ROOT"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -45,7 +50,8 @@ install -d -o root -g root -m 0700 "$backup"
 cp -a "$GLOBAL_ROUTE" "$GATEWAY_CONFIG" "$backup/"
 [[ -e "$GLOBAL_INBOUND" ]] && cp -a "$GLOBAL_INBOUND" "$backup/global-inbound.json"
 [[ -e "$SETTINGS" ]] && cp -a "$SETTINGS" "$backup/gemini-warp.json"
-[[ -e "$GATEWAY_RULE_SET" ]] && cp -a "$GATEWAY_RULE_SET" "$backup/gemini.srs"
+[[ -e "$GEMINI_RULE_SET" ]] && cp -a "$GEMINI_RULE_SET" "$backup/gemini.srs"
+[[ -e "$GOOGLE_RULE_SET" ]] && cp -a "$GOOGLE_RULE_SET" "$backup/google.srs"
 [[ -e "$EGRESS_DROPIN" ]] && cp -a "$EGRESS_DROPIN" "$backup/egress-dropin.conf"
 
 rollback() {
@@ -62,9 +68,14 @@ rollback() {
     rm -f "$SETTINGS"
   fi
   if [[ -e "$backup/gemini.srs" ]]; then
-    cp -a "$backup/gemini.srs" "$GATEWAY_RULE_SET"
+    cp -a "$backup/gemini.srs" "$GEMINI_RULE_SET"
   else
-    rm -f "$GATEWAY_RULE_SET"
+    rm -f "$GEMINI_RULE_SET"
+  fi
+  if [[ -e "$backup/google.srs" ]]; then
+    cp -a "$backup/google.srs" "$GOOGLE_RULE_SET"
+  else
+    rm -f "$GOOGLE_RULE_SET"
   fi
   if [[ -e "$backup/egress-dropin.conf" ]]; then
     install -d -o root -g root -m 0755 "$EGRESS_DROPIN_DIR"
@@ -83,34 +94,42 @@ jq -n --argjson port "$WARP_PROXY_PORT" '{
 install -o root -g root -m 0644 "$GLOBAL_INBOUND.next" "$GLOBAL_INBOUND"
 rm -f "$GLOBAL_INBOUND.next"
 
-jq --arg inbound "browser-gateway-warp" --arg warp "$WARP_ENDPOINT_TAG" --arg ruleset "$WARP_RULE_SET_TAG" '
+jq --arg inbound "browser-gateway-warp" --arg warp "$WARP_ENDPOINT_TAG" \
+  --arg gemini "$GEMINI_RULE_SET_TAG" --arg google "$GOOGLE_RULE_SET_TAG" '
   .route.rules = (
     [
       {inbound:[$inbound],action:"route",outbound:$warp},
-      {rule_set:[$ruleset],action:"route",outbound:$warp}
+      {rule_set:[$gemini,$google],action:"route",outbound:$warp}
     ] +
     [
       .route.rules[] |
       select(((.inbound // []) | index($inbound)) == null) |
-      select((((.rule_set // []) | index($ruleset)) == null) or (.outbound != $warp))
+      select(((((.rule_set // []) | index($gemini)) == null) and (((.rule_set // []) | index($google)) == null)) or (.outbound != $warp))
     ]
   )
 ' "$GLOBAL_ROUTE" > "$GLOBAL_ROUTE.next"
 install -o root -g root -m 0644 "$GLOBAL_ROUTE.next" "$GLOBAL_ROUTE"
 rm -f "$GLOBAL_ROUTE.next"
 
-jq -n --argjson port "$WARP_PROXY_PORT" --arg rule_set_path "$GATEWAY_RULE_SET" '{
+jq -n --argjson port "$WARP_PROXY_PORT" --arg gemini_path "$GEMINI_RULE_SET" --arg google_path "$GOOGLE_RULE_SET" '{
   enabled:true,
   proxy_port:$port,
-  rule_set_path:$rule_set_path
+  rule_sets:[
+    {tag:"gemini-warp-gemini",path:$gemini_path},
+    {tag:"gemini-warp-google",path:$google_path}
+  ]
 }' > "$SETTINGS.next"
 install -o root -g browser-gateway -m 0640 "$SETTINGS.next" "$SETTINGS"
 rm -f "$SETTINGS.next"
 
 curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
-  "$rule_set_url" --output "$GATEWAY_RULE_SET.next"
-install -o root -g browser-gateway -m 0640 "$GATEWAY_RULE_SET.next" "$GATEWAY_RULE_SET"
-rm -f "$GATEWAY_RULE_SET.next"
+  "$gemini_rule_set_url" --output "$GEMINI_RULE_SET.next"
+install -o root -g browser-gateway -m 0640 "$GEMINI_RULE_SET.next" "$GEMINI_RULE_SET"
+rm -f "$GEMINI_RULE_SET.next"
+curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+  "$google_rule_set_url" --output "$GOOGLE_RULE_SET.next"
+install -o root -g browser-gateway -m 0640 "$GOOGLE_RULE_SET.next" "$GOOGLE_RULE_SET"
+rm -f "$GOOGLE_RULE_SET.next"
 
 install -d -o root -g root -m 0755 "$EGRESS_DROPIN_DIR"
 cat > "$EGRESS_DROPIN.next" <<'EOF'
@@ -128,12 +147,12 @@ jq --slurpfile warp "$SETTINGS" '
   ($warp[0]) as $w |
   .outbounds = ([.outbounds[] | select(.tag != "gemini-warp")] +
     [{type:"socks",tag:"gemini-warp",server:"127.0.0.1",server_port:$w.proxy_port,version:"5"}]) |
-  .route.rule_set = ([.route.rule_set[]? | select(.tag != "gemini-warp-domains")] +
-    [{type:"local",tag:"gemini-warp-domains",format:"binary",path:$w.rule_set_path}]) |
+  .route.rule_set = ([.route.rule_set[]? | select(.tag | startswith("gemini-warp-") | not)] +
+    ($w.rule_sets | map({type:"local",tag:.tag,format:"binary",path:.path}))) |
   .route.rules = (
     [.route.rules[] | select(.outbound != "gemini-warp")] |
     .[0:4] +
-    [{rule_set:["gemini-warp-domains"],port:[80,443],action:"route",outbound:"gemini-warp"}] +
+    [{rule_set:($w.rule_sets | map(.tag)),port:[80,443],action:"route",outbound:"gemini-warp"}] +
     .[4:]
   )
 ' "$GATEWAY_CONFIG" > "$GATEWAY_CONFIG.next"

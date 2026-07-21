@@ -20,10 +20,10 @@ Gemini 相关域名
 服务器已有一套正常运行的系统 sing-box，并包含：
 
 - 标签为 `wireguard-out` 的 Cloudflare WireGuard endpoint；
-- 标签为 `gemini` 的规则集；
+- 标签为 `gemini` 和 `google` 的规则集；
 - Browser Gateway 已经部署完成。
 
-脚本会复用这些现有配置，不会创建第二份 WARP 身份。现有 Gemini 规则集会复制为 Browser Gateway 的本地二进制规则集，因此两个入口采用同一份域名范围，也不依赖服务启动时临时下载规则。
+脚本会复用这些现有配置，不会创建第二份 WARP 身份。Gemini 与 Google 规则集会复制为 Browser Gateway 的本地二进制规则集，因此 API、Gemini 网页、Google 登录和页面依赖的公共后端会保持同一 WARP 出口，也不依赖服务启动时临时下载规则。
 
 ## 启用
 
