@@ -60,6 +60,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\harden-server.ps1 `
 
 加固后仍可用同一私钥登录 root，但不能再用 root 密码通过 SSH 登录。请保留云服务商控制台的救援入口。
 
+如果之后确实需要恢复 root 密码 SSH，同时保留密钥登录，可运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\enable-password-ssh.ps1 `
+  -Server '<服务器公网 IP>' `
+  -IdentityFile "$HOME\.ssh\browser_gateway_ed25519"
+```
+
+该命令不会修改 root 密码，只会在确认服务器已有未锁定密码后恢复密码认证。密码登录的暴力破解风险高于纯密钥登录，应使用强密码并妥善保管。
+
+## Gemini 使用 WARP 分流
+
+服务器已有 Cloudflare WARP WireGuard endpoint 和 Gemini 规则集时，可以仅让 Gemini 相关请求经过 WARP，其他网站继续使用服务器原生出口。配置方法、链路和验证命令见 [Gemini 的 WARP 分流](docs/GEMINI_WARP.md)。
+
 ## 安装 Chrome 扩展
 
 1. 在 Chrome 打开 `chrome://extensions`。

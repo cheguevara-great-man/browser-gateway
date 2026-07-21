@@ -14,6 +14,7 @@ TLS_ROOT="$CONFIG_ROOT/tls"
 CREDENTIALS_FILE="/root/browser-gateway-credentials.json"
 WEBROOT="/var/www/html"
 POLICY_PORT="18088"
+GEMINI_WARP_SETTINGS="$CONFIG_ROOT/gemini-warp.json"
 USAGE_PORT="9443"
 USAGE_BACKEND_PORT="19443"
 USAGE_SOURCE="/root/browser-gateway-usage-collector.py"
@@ -238,6 +239,26 @@ jq -n --argjson port "$POLICY_PORT" --argjson usage_port "$USAGE_PORT" --arg ip 
     final:"direct"
   }
 }' > "$CONFIG_ROOT/egress.json.next"
+
+# An optional, server-local Gemini split-routing profile is installed by
+# configure-gemini-warp.sh.  Keeping the small marker under CONFIG_ROOT makes
+# the policy survive normal Browser Gateway upgrades without coupling the base
+# installer to a particular system-wide sing-box setup.
+if [[ -s "$GEMINI_WARP_SETTINGS" ]] && jq -e '.enabled == true' "$GEMINI_WARP_SETTINGS" >/dev/null; then
+  gemini_rule_set_path="$(jq -er '.rule_set_path' "$GEMINI_WARP_SETTINGS")"
+  [[ -s "$gemini_rule_set_path" ]] || fail "Gemini WARP rule-set is missing: $gemini_rule_set_path"
+  jq --slurpfile warp "$GEMINI_WARP_SETTINGS" '
+    ($warp[0]) as $w |
+    .outbounds += [{type:"socks",tag:"gemini-warp",server:"127.0.0.1",server_port:$w.proxy_port,version:"5"}] |
+    .route.rule_set = [{type:"local",tag:"gemini-warp-domains",format:"binary",path:$w.rule_set_path}] |
+    .route.rules = (
+      .route.rules[0:4] +
+      [{rule_set:["gemini-warp-domains"],port:[80,443],action:"route",outbound:"gemini-warp"}] +
+      .route.rules[4:]
+    )
+  ' "$CONFIG_ROOT/egress.json.next" > "$CONFIG_ROOT/egress.json.warp"
+  mv -f "$CONFIG_ROOT/egress.json.warp" "$CONFIG_ROOT/egress.json.next"
+fi
 install -o root -g browser-gateway -m 0640 "$CONFIG_ROOT/egress.json.next" "$CONFIG_ROOT/egress.json"
 rm -f "$CONFIG_ROOT/egress.json.next"
 
