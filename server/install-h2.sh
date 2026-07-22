@@ -254,7 +254,10 @@ if [[ -s "$GEMINI_WARP_SETTINGS" ]] && jq -e '.enabled == true' "$GEMINI_WARP_SE
     .route.rule_set = ($w.rule_sets | map({type:"local",tag:.tag,format:"binary",path:.path})) |
     .route.rules = (
       .route.rules[0:4] +
-      [{rule_set:($w.rule_sets | map(.tag)),port:[80,443],action:"route",outbound:"gemini-warp"}] +
+      ((if ($w.rule_sets | length) > 0 then
+         [{rule_set:($w.rule_sets | map(.tag)),port:[80,443],action:"route",outbound:"gemini-warp"}]
+        else [] end) +
+       [{domain_suffix:$w.web_domain_suffix,port:[80,443],action:"route",outbound:"gemini-warp"}]) +
       .route.rules[4:]
     )
   ' "$CONFIG_ROOT/egress.json.next" > "$CONFIG_ROOT/egress.json.warp"

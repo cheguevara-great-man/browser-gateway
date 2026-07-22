@@ -79,12 +79,18 @@ try {
   const warmRequestMs = orderedWarmSamples[Math.floor(orderedWarmSamples.length / 2)];
 
   const chatgptPage = await context.newPage();
+  const googlePage = await context.newPage();
+  const geminiPage = await context.newPage();
   const checks = await Promise.all([
     page.goto("https://github.com/", { waitUntil: "domcontentloaded", timeout: 30_000 }),
     chatgptPage.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 30_000 }),
+    googlePage.goto("https://www.google.com/", { waitUntil: "domcontentloaded", timeout: 30_000 }),
+    geminiPage.goto("https://gemini.google.com/app", { waitUntil: "domcontentloaded", timeout: 30_000 }),
   ]);
   assert.ok(checks[0]?.status() < 500, `GitHub returned ${checks[0]?.status()}`);
   assert.ok(checks[1]?.status() < 500, `ChatGPT returned ${checks[1]?.status()}`);
+  assert.equal(checks[2]?.status(), 200, `Google returned ${checks[2]?.status()}`);
+  assert.equal(checks[3]?.status(), 200, `Gemini returned ${checks[3]?.status()}`);
 
   await context.close();
   context = null;
