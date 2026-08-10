@@ -70,9 +70,10 @@ Bridge 2.7/2.8 已排队事件继续兼容。
 电脑：在任意电脑使用管理员账号登录网页，都可以修改预算、费率和设备。不要把管理员凭据写入
 设备配置或发送给普通使用者。
 
-部署和日常使用只保留 `deployment.local.json` 与 `usage-admin.local.json` 两份客户端凭据；不再
-生成独立的 `usage-viewer.local.json`。部署脚本会为本地凭据设置仅当前 Windows 用户可读写的
-ACL；这些文件不会进入 Git。
+普通电脑只需要一份 `deployment.local.json`，其中已包含 Gateway、用量上报和只读网页信息；不再
+生成独立的 `usage-viewer.local.json`。`usage-admin.local.json` 仅保存网页管理员/应急凭据，不是
+设备配置，也不需要分发给普通电脑。部署脚本会为本地凭据设置仅当前 Windows 用户可读写的 ACL；
+这些文件不会进入 Git。
 
 ## 从网页添加设备（推荐）
 
