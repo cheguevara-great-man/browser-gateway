@@ -18,6 +18,22 @@
 
       <section id="notice" class="notice hidden" role="status"></section>
 
+      <section class="enrollment">
+        <h2>设备注册</h2>
+        <label>统计服务器
+          <input id="enrollmentServer" type="url" placeholder="https://服务器IP:9443">
+        </label>
+        <label>一次性注册码
+          <input id="enrollmentCode" autocomplete="off" maxlength="9" placeholder="ABCD-2345">
+        </label>
+        <div class="actions">
+          <button id="enrollButton" class="secondary" type="button">注册这台设备</button>
+          <button id="dashboardButton" class="secondary" type="button">打开用量统计</button>
+        </div>
+        <button id="syncBridgeButton" class="secondary sync-button" type="button" hidden>重新同步到 AI Bridge</button>
+        <p id="enrollmentState">尚未注册</p>
+      </section>
+
       <form id="settingsForm">
         <label>服务器
           <input id="host" autocomplete="off" required>

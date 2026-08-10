@@ -10,6 +10,7 @@ body { margin: 0; width: 360px; }
 main { padding: 18px; }
 header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 14px; }
 h1 { font-size: 19px; margin: 0 0 3px; letter-spacing: -.2px; }
+h2 { font-size: 14px; margin: 0 0 10px; }
 header p { margin: 0; color: #718096; font-size: 12px; }
 .badge { padding: 5px 9px; border-radius: 999px; font-size: 12px; font-weight: 700; }
 .badge.on { color: #087443; background: #d9f7e8; }
@@ -35,3 +36,8 @@ form button { grid-column: 1 / -1; }
 .details span { color: #748094; }
 .details strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.enrollment { margin: 0 0 14px; padding: 12px; background: white; border: 1px solid #e1e6ee; border-radius: 9px; }
+.enrollment label { display: block; margin-top: 8px; }
+.enrollment .actions { margin-top: 10px; }
+.enrollment p { margin: 9px 0 0; color: #718096; font-size: 12px; }
+.sync-button { width: 100%; margin-top: 9px; }

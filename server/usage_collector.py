@@ -9,6 +9,8 @@ import hashlib
 import hmac
 import html
 import json
+import re
+import secrets
 import sqlite3
 import sys
 import time
@@ -21,6 +23,9 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 MAX_BODY = 256 * 1024
 BEIJING = timezone(timedelta(hours=8))
+ENROLLMENT_TTL_SECONDS = 10 * 60
+DEVICE_SESSION_TTL_SECONDS = 2 * 60
+ENROLLMENT_CODE_RE = re.compile(r"^[A-Z2-9]{4}-[A-Z2-9]{4}$")
 
 # Official Codex token-based rate card, credits per one million tokens.
 # Unknown future models deliberately remain unrated until configured in the dashboard.
@@ -44,6 +49,7 @@ class UsageServer(ThreadingHTTPServer):
         self, address, handler, *, database: Path, report_token: str,
         admin_token: str, dashboard_admin_username: str, dashboard_admin_password: str,
         dashboard_viewer_username: str, dashboard_viewer_password: str, session_secret: str,
+        device_bootstrap: dict[str, object] | None = None,
     ):
         self.database = database
         self.report_token = report_token
@@ -53,6 +59,7 @@ class UsageServer(ThreadingHTTPServer):
         self.dashboard_viewer_username = dashboard_viewer_username
         self.dashboard_viewer_password = dashboard_viewer_password
         self.session_secret = session_secret.encode("utf-8")
+        self.device_bootstrap = dict(device_bootstrap or {})
         super().__init__(address, handler)
         initialize(database)
 
@@ -93,8 +100,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(404, {"error": "not_found"})
                 return
             query = parse_qs(path.query)
+            data = summary(self.server.database, days, start_date, end_date)
+            data["registered_devices"] = registered_devices(self.server.database)
+            _apply_registered_device_names(data)
             self._html(200, dashboard_page(
-                summary(self.server.database, days, start_date, end_date), session[0], session[1], days,
+                data, session[0], session[1], days,
                 self.server.session_secret, page=page,
                 machine_id=query.get("id", [""])[0],
             ))
@@ -102,14 +112,33 @@ class Handler(BaseHTTPRequestHandler):
         if path.path == "/logout":
             self._redirect("/dashboard", clear_session=True)
             return
+        if path.path == "/device-login":
+            ticket = parse_qs(path.query).get("ticket", [""])[0]
+            if not consume_device_session_ticket(self.server.database, ticket):
+                self._html(401, login_page(error=True))
+                return
+            token = create_session(self.server.session_secret, role="viewer")
+            self.send_response(303)
+            self.send_header("Location", "/dashboard")
+            self.send_header(
+                "Set-Cookie",
+                f"bg_usage_session={token}; Path=/; Max-Age=43200; Secure; HttpOnly; SameSite=Strict",
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path.path == "/health":
             self._json(200, {"status": "ok"})
             return
         if path.path == "/v1/usage/policy":
-            if not self._authorized(self.server.report_token):
+            device = self._device()
+            if not self._authorized(self.server.report_token) and device is None:
                 self._json(401, {"error": "unauthorized"})
                 return
             machine_id = parse_qs(path.query).get("machine_id", [""])[0]
+            if device is not None and machine_id != device["machine_id"]:
+                self._json(403, {"error": "device_scope_mismatch"})
+                return
             try:
                 self._json(200, machine_policy(self.server.database, machine_id))
             except ValueError:
@@ -118,28 +147,52 @@ class Handler(BaseHTTPRequestHandler):
         if path.path != "/v1/usage/summary":
             self._json(404, {"error": "not_found"})
             return
-        if not self._authorized(self.server.admin_token) and self._session() is None:
+        if (
+            not self._authorized(self.server.admin_token)
+            and self._session() is None
+            and self._device() is None
+        ):
             self._json(401, {"error": "unauthorized"})
             return
         days, start_date, end_date = _query_scope(path.query, self.server.database)
-        self._json(200, summary(self.server.database, days, start_date, end_date))
+        data = summary(self.server.database, days, start_date, end_date)
+        data["registered_devices"] = registered_devices(self.server.database)
+        _apply_registered_device_names(data)
+        self._json(200, data)
 
     def do_POST(self):  # noqa: N802
         path = urlsplit(self.path).path
         if path == "/login":
             self._login()
             return
+        if path == "/v1/enrollment/redeem":
+            self._redeem_enrollment()
+            return
+        if path == "/v1/device/session":
+            self._create_device_session()
+            return
+        if path in {"/dashboard/device/create", "/dashboard/device/update"}:
+            self._dashboard_device_update(path)
+            return
         if path in {"/dashboard/rate", "/dashboard/budget", "/dashboard/control"}:
             self._dashboard_update(path)
             return
         if path == "/v1/usage/quota":
-            if not self._authorized(self.server.report_token):
+            device = self._device()
+            if not self._authorized(self.server.report_token) and device is None:
                 self._discard_body()
                 self._json(401, {"error": "unauthorized"})
                 return
             try:
                 value = self._json_body()
+                if device is not None and (
+                    not isinstance(value, dict) or value.get("machine_id") != device["machine_id"]
+                ):
+                    raise PermissionError("device scope mismatch")
                 quota = insert_quota_snapshot(self.server.database, value)
+            except PermissionError:
+                self._json(403, {"error": "device_scope_mismatch"})
+                return
             except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
                 self._json(400, {"error": "invalid_quota"})
                 return
@@ -148,7 +201,8 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/v1/usage/events":
             self._json(404, {"error": "not_found"})
             return
-        if not self._authorized(self.server.report_token):
+        device = self._device()
+        if not self._authorized(self.server.report_token) and device is None:
             self._discard_body()
             self._json(401, {"error": "unauthorized"})
             return
@@ -157,11 +211,81 @@ class Handler(BaseHTTPRequestHandler):
             events = value if isinstance(value, list) else [value]
             if not 1 <= len(events) <= 100:
                 raise ValueError("invalid event count")
+            if device is not None and any(
+                not isinstance(event, dict) or event.get("machine_id") != device["machine_id"]
+                for event in events
+            ):
+                raise PermissionError("device scope mismatch")
+            if device is not None:
+                events = [
+                    {**event, "machine_name": device["machine_name"]}
+                    for event in events if isinstance(event, dict)
+                ]
             accepted = insert_events(self.server.database, events)
+            if device is not None:
+                touch_device(self.server.database, str(device["machine_id"]))
+        except PermissionError:
+            self._json(403, {"error": "device_scope_mismatch"})
+            return
         except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
             self._json(400, {"error": "invalid_event"})
             return
         self._json(202, {"accepted": accepted})
+
+    def _redeem_enrollment(self) -> None:
+        try:
+            value = self._json_body()
+            if not isinstance(value, dict):
+                raise ValueError("invalid enrollment")
+            result = redeem_enrollment(
+                self.server.database,
+                str(value.get("code", "")),
+                str(value.get("machine_id", "")),
+                self.server.device_bootstrap,
+            )
+        except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+            self._json(400, {"error": "invalid_or_expired_enrollment"})
+            return
+        self._json(200, result)
+
+    def _create_device_session(self) -> None:
+        device = self._device()
+        self._discard_body()
+        if device is None:
+            self._json(401, {"error": "unauthorized"})
+            return
+        ticket = create_device_session_ticket(self.server.database, str(device["machine_id"]))
+        dashboard_url = str(self.server.device_bootstrap.get("dashboardUrl", "/dashboard"))
+        origin = dashboard_url.split("/dashboard", 1)[0].rstrip("/")
+        self._json(200, {"loginUrl": f"{origin}/device-login?{urlencode({'ticket': ticket})}"})
+
+    def _dashboard_device_update(self, path: str) -> None:
+        session = self._session()
+        if session is None or session[1] != "admin":
+            self._json(403, {"error": "administrator_required"})
+            return
+        try:
+            form = self._form(8192)
+            if not hmac.compare_digest(
+                form.get("csrf", [""])[0].encode("utf-8"),
+                csrf_token(self.server.session_secret, session[0]).encode("ascii"),
+            ):
+                raise ValueError("csrf")
+            if path.endswith("/create"):
+                name = form.get("machine_name", [""])[0]
+                code, expires_at = create_enrollment(self.server.database, name)
+                self._html(200, enrollment_created_page(code, name, expires_at))
+                return
+            update_device(
+                self.server.database,
+                form.get("machine_id", [""])[0],
+                action=form.get("action", [""])[0],
+                machine_name=form.get("machine_name", [""])[0],
+            )
+        except (ValueError, OverflowError):
+            self._redirect("/dashboard/machines?error=1")
+            return
+        self._redirect("/dashboard/machines")
 
     def _json_body(self) -> object:
         length = int(self.headers.get("Content-Length", "-1"))
@@ -267,6 +391,12 @@ class Handler(BaseHTTPRequestHandler):
         supplied = self.headers.get("Authorization", "")
         return hmac.compare_digest(supplied, f"Bearer {expected}")
 
+    def _device(self) -> dict[str, object] | None:
+        supplied = self.headers.get("Authorization", "")
+        if not supplied.startswith("Bearer "):
+            return None
+        return authenticate_device(self.server.database, supplied[7:])
+
     def _discard_body(self) -> None:
         try:
             length = min(max(int(self.headers.get("Content-Length", "0")), 0), MAX_BODY)
@@ -363,6 +493,27 @@ def initialize(path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_quota_observed_at
                 ON quota_snapshots(observed_at DESC);
+            CREATE TABLE IF NOT EXISTS devices(
+                machine_id TEXT PRIMARY KEY,
+                machine_name TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                last_seen INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS enrollment_codes(
+                code_hash TEXT PRIMARY KEY,
+                machine_name TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                redeemed_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS device_session_tickets(
+                ticket_hash TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used_at INTEGER
+            );
             """
         )
         columns = {row[1] for row in database.execute("PRAGMA table_info(usage_events)")}
@@ -374,6 +525,195 @@ def initialize(path: Path) -> None:
             database.execute(
                 "ALTER TABLE usage_events ADD COLUMN service_tier TEXT NOT NULL DEFAULT 'default'"
             )
+
+
+def _secret_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _new_enrollment_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    raw = "".join(secrets.choice(alphabet) for _ in range(8))
+    return f"{raw[:4]}-{raw[4:]}"
+
+
+def create_enrollment(path: Path, machine_name: str, now: int | None = None) -> tuple[str, int]:
+    name = machine_name.strip()
+    if not 1 <= len(name) <= 128 or any(ord(character) < 32 for character in name):
+        raise ValueError("invalid machine name")
+    current = int(time.time()) if now is None else now
+    expires_at = current + ENROLLMENT_TTL_SECONDS
+    with closing(connect(path)) as database, database:
+        database.execute("DELETE FROM enrollment_codes WHERE expires_at < ? OR redeemed_at IS NOT NULL", (current,))
+        for _attempt in range(8):
+            code = _new_enrollment_code()
+            try:
+                database.execute(
+                    "INSERT INTO enrollment_codes(code_hash,machine_name,expires_at,created_at) VALUES(?,?,?,?)",
+                    (_secret_hash(code), name, expires_at, current),
+                )
+                return code, expires_at
+            except sqlite3.IntegrityError:
+                continue
+    raise RuntimeError("could not allocate enrollment code")
+
+
+def redeem_enrollment(
+    path: Path,
+    code: str,
+    requested_machine_id: str,
+    bootstrap: dict[str, object],
+    now: int | None = None,
+) -> dict[str, object]:
+    gateway = bootstrap.get("gateway")
+    collector_url = bootstrap.get("usageCollectorUrl")
+    dashboard_url = bootstrap.get("dashboardUrl")
+    if not isinstance(gateway, dict) or not isinstance(collector_url, str) or not isinstance(dashboard_url, str):
+        raise ValueError("device bootstrap unavailable")
+    normalized = code.strip().upper()
+    if not ENROLLMENT_CODE_RE.fullmatch(normalized):
+        raise ValueError("invalid enrollment code")
+    machine_id = requested_machine_id.strip()
+    if machine_id:
+        try:
+            import uuid
+            machine_id = str(uuid.UUID(machine_id))
+        except ValueError as error:
+            raise ValueError("invalid machine id") from error
+    else:
+        import uuid
+        machine_id = str(uuid.uuid4())
+    current = int(time.time()) if now is None else now
+    token = secrets.token_urlsafe(32)
+    with closing(connect(path)) as database, database:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute(
+            "SELECT machine_name,expires_at,redeemed_at FROM enrollment_codes WHERE code_hash=?",
+            (_secret_hash(normalized),),
+        ).fetchone()
+        if row is None or int(row[1]) < current or row[2] is not None:
+            raise ValueError("expired enrollment")
+        name = str(row[0])
+        if database.execute(
+            "SELECT 1 FROM devices WHERE machine_id=?", (machine_id,)
+        ).fetchone() is not None:
+            raise ValueError("machine already enrolled")
+        database.execute(
+            "INSERT INTO devices(machine_id,machine_name,token_hash,enabled,created_at,last_seen) "
+            "VALUES(?,?,?,1,?,?)",
+            (machine_id, name, _secret_hash(token), current, current),
+        )
+        database.execute(
+            "UPDATE enrollment_codes SET redeemed_at=? WHERE code_hash=?",
+            (current, _secret_hash(normalized)),
+        )
+    return {
+        "machineId": machine_id,
+        "machineName": name,
+        "deviceToken": token,
+        "gateway": gateway,
+        "usageCollectorUrl": collector_url,
+        "dashboardUrl": dashboard_url,
+    }
+
+
+def authenticate_device(path: Path, token: str) -> dict[str, object] | None:
+    if not 20 <= len(token) <= 256:
+        return None
+    with closing(connect(path)) as database:
+        row = database.execute(
+            "SELECT machine_id,machine_name,enabled FROM devices WHERE token_hash=?",
+            (_secret_hash(token),),
+        ).fetchone()
+    if row is None or not bool(row[2]):
+        return None
+    return {"machine_id": str(row[0]), "machine_name": str(row[1])}
+
+
+def touch_device(path: Path, machine_id: str, now: int | None = None) -> None:
+    with closing(connect(path)) as database, database:
+        database.execute(
+            "UPDATE devices SET last_seen=? WHERE machine_id=?",
+            (int(time.time()) if now is None else now, machine_id),
+        )
+
+
+def create_device_session_ticket(path: Path, machine_id: str, now: int | None = None) -> str:
+    current = int(time.time()) if now is None else now
+    ticket = secrets.token_urlsafe(32)
+    with closing(connect(path)) as database, database:
+        database.execute("DELETE FROM device_session_tickets WHERE expires_at < ? OR used_at IS NOT NULL", (current,))
+        database.execute(
+            "INSERT INTO device_session_tickets(ticket_hash,machine_id,expires_at) VALUES(?,?,?)",
+            (_secret_hash(ticket), machine_id, current + DEVICE_SESSION_TTL_SECONDS),
+        )
+    return ticket
+
+
+def consume_device_session_ticket(path: Path, ticket: str, now: int | None = None) -> bool:
+    if not 20 <= len(ticket) <= 256:
+        return False
+    current = int(time.time()) if now is None else now
+    with closing(connect(path)) as database, database:
+        cursor = database.execute(
+            "UPDATE device_session_tickets SET used_at=? WHERE ticket_hash=? "
+            "AND expires_at>=? AND used_at IS NULL",
+            (current, _secret_hash(ticket), current),
+        )
+        return cursor.rowcount == 1
+
+
+def registered_devices(path: Path) -> list[dict[str, object]]:
+    with closing(connect(path)) as database:
+        rows = database.execute(
+            "SELECT machine_id,machine_name,enabled,created_at,last_seen FROM devices ORDER BY machine_name,machine_id"
+        ).fetchall()
+    return [
+        {
+            "machine_id": str(row[0]), "machine_name": str(row[1]), "enabled": bool(row[2]),
+            "created_at": datetime.fromtimestamp(int(row[3]), timezone.utc).isoformat(),
+            "last_seen": datetime.fromtimestamp(int(row[4]), timezone.utc).isoformat() if row[4] else None,
+        }
+        for row in rows
+    ]
+
+
+def _apply_registered_device_names(data: dict[str, object]) -> None:
+    names = {
+        str(item["machine_id"]): str(item["machine_name"])
+        for item in data.get("registered_devices", []) if isinstance(item, dict)
+    }
+    for machine in data.get("machines", []):
+        if isinstance(machine, dict) and str(machine.get("machine_id")) in names:
+            machine["machine_name"] = names[str(machine["machine_id"])]
+    for day in data.get("daily", []):
+        if not isinstance(day, dict):
+            continue
+        for machine in day.get("machines", []):
+            if isinstance(machine, dict) and str(machine.get("machine_id")) in names:
+                machine["machine_name"] = names[str(machine["machine_id"])]
+
+
+def update_device(path: Path, machine_id: str, *, action: str, machine_name: str = "") -> None:
+    if action not in {"rename", "enable", "disable", "revoke"}:
+        raise ValueError("invalid device action")
+    with closing(connect(path)) as database, database:
+        if action == "rename":
+            name = machine_name.strip()
+            if not 1 <= len(name) <= 128 or any(ord(character) < 32 for character in name):
+                raise ValueError("invalid machine name")
+            cursor = database.execute(
+                "UPDATE devices SET machine_name=? WHERE machine_id=?", (name, machine_id)
+            )
+        elif action == "revoke":
+            cursor = database.execute("DELETE FROM devices WHERE machine_id=?", (machine_id,))
+        else:
+            cursor = database.execute(
+                "UPDATE devices SET enabled=? WHERE machine_id=?",
+                (1 if action == "enable" else 0, machine_id),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("device not found")
 
 
 def insert_events(path: Path, events: list[object]) -> int:
@@ -1135,7 +1475,7 @@ def dashboard_page(
 ) -> str:
     content = {
         "overview": lambda: _overview_page(data, days),
-        "machines": lambda: _machines_page(data, days),
+        "machines": lambda: _machines_page(data, session, role, days, secret),
         "models": lambda: _models_page(data),
         "machine": lambda: _machine_page(data, machine_id),
         "settings": lambda: _settings_page(data, session, role, days, secret),
@@ -1317,7 +1657,9 @@ def _daily_page(data: dict[str, object]) -> str:
 <tbody>{''.join(rows) or '<tr><td colspan="8" class="empty">尚无每日数据</td></tr>'}</tbody></table></div></section>"""
 
 
-def _machines_page(data: dict[str, object], days: int) -> str:
+def _machines_page(
+    data: dict[str, object], session: str, role: str, days: int, secret: bytes
+) -> str:
     rows = []
     for item in data["machines"]:
         link = "/dashboard/machine?" + urlencode({"id": item["machine_id"], "start": data["start_date"], "end": data["end_date"]})
@@ -1333,9 +1675,41 @@ def _machines_page(data: dict[str, object], days: int) -> str:
         rows.append(f"""<tr><td><a class="name" href="{link}">{html.escape(item['machine_name'])}</a><small>{html.escape(item['machine_id'])}</small></td>
 <td><span class="advice {item['allocation_status']}">{status}</span></td><td>{allocation}</td><td>{_credits(item['estimated_credits'])}</td>
 <td>{_number(item['requests'])}</td><td>{item['cache_hit_rate']:.1f}%</td><td class="mix">{top}</td><td>{html.escape(_short_time(item['last_seen']))}</td></tr>""")
-    return f"""{_cards(data['totals'])}<section class="panel"><div class="panel-head"><div><h2>设备额度</h2><p>用于判断哪台设备可以多用、哪台应减量；点击名称查看用量组成。</p></div></div>
+    device_rows = []
+    csrf = csrf_token(secret, session)
+    for device in data.get("registered_devices", []):
+        status = "设备身份已启用" if device["enabled"] else "设备身份已停用"
+        action = "disable" if device["enabled"] else "enable"
+        action_label = "停用" if device["enabled"] else "启用"
+        controls = ""
+        if role == "admin":
+            controls = f'''<form class="device-actions" method="post" action="/dashboard/device/update">
+<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="machine_id" value="{html.escape(device['machine_id'], quote=True)}">
+<input name="machine_name" value="{html.escape(device['machine_name'], quote=True)}" maxlength="128" required>
+<button name="action" value="rename">改名</button><button name="action" value="{action}">{action_label}</button>
+<button class="danger-button" name="action" value="revoke" onclick="return confirm('撤销后该设备必须重新注册才能继续上报和查看统计，确定继续？')">撤销身份</button></form>'''
+        device_rows.append(f'''<tr><td><strong>{html.escape(device['machine_name'])}</strong><small>{html.escape(device['machine_id'])}</small></td>
+<td>{status}</td><td>{html.escape(_short_time(device['last_seen'])) if device['last_seen'] else '尚未上报'}</td><td>{controls or '只读账号不能修改'}</td></tr>''')
+    enrollment = ""
+    if role == "admin":
+        enrollment = f'''<section class="panel"><div class="panel-head"><div><h2>添加设备</h2><p>生成一个十分钟有效、只能使用一次的注册码。所有设备权限相同。</p></div></div>
+<form class="enrollment-form" method="post" action="/dashboard/device/create"><input type="hidden" name="csrf" value="{csrf}">
+<label>设备名称<input name="machine_name" maxlength="128" placeholder="例如：公司电脑-03" required></label><button>生成注册码</button></form></section>'''
+    registered = f'''<section class="panel"><div class="panel-head"><div><h2>已注册设备</h2><p>设备只拥有 Gateway、用量上报和只读统计权限；管理员权限只属于网页登录账号。</p></div></div>
+<div class="table-wrap"><table><thead><tr><th>设备</th><th>注册状态</th><th>最后上报</th><th>操作</th></tr></thead>
+<tbody>{''.join(device_rows) or '<tr><td colspan="4" class="empty">尚无通过注册码注册的设备</td></tr>'}</tbody></table></div></section>'''
+    return f"""{enrollment}{registered}{_cards(data['totals'])}<section class="panel"><div class="panel-head"><div><h2>设备额度</h2><p>用于判断哪台设备可以多用、哪台应减量；点击名称查看用量组成。</p></div></div>
 <div class="table-wrap"><table><thead><tr><th>设备</th><th>状态</th><th>已用 / 均分上限</th><th>Credits</th><th>请求</th><th>缓存率</th><th>主要模型</th><th>最后使用</th></tr></thead>
 <tbody>{''.join(rows) or '<tr><td colspan="8" class="empty">尚无设备数据</td></tr>'}</tbody></table></div></section>"""
+
+
+def enrollment_created_page(code: str, machine_name: str, expires_at: int) -> str:
+    expires = datetime.fromtimestamp(expires_at, timezone.utc).astimezone(BEIJING).strftime("%Y-%m-%d %H:%M:%S")
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>设备注册码</title><style>{_CSS}</style></head><body class="login-body"><main class="login-card enrollment-result">
+<h1>设备注册码</h1><p class="muted">{html.escape(machine_name)} · 有效至 {expires}</p><div class="enrollment-code">{html.escape(code)}</div>
+<p class="muted">在目标电脑的 Browser Gateway 插件中输入该注册码。注册码只能使用一次。</p><a class="button-link" href="/dashboard/machines">返回设备管理</a>
+</main></body></html>'''
 
 
 def _models_page(data: dict[str, object]) -> str:
@@ -1482,7 +1856,8 @@ main{max-width:1440px;margin:auto;padding:22px}.toolbar{display:flex;justify-con
 .control-form:has(input[value="official"]:checked) .manual-fields{opacity:.42}.control-form:has(input[value="manual"]:checked) .official-mode{opacity:.42}
 .total-bar{display:flex;overflow:hidden}.total-bar i{border-radius:0}.total-bar .used{background:linear-gradient(90deg,#2463eb,#5b8def)}.total-bar .remaining{background:#dce7f7}.total-bar.limit .used{background:linear-gradient(90deg,#e05252,#c53030)}.total-bar.reduce .used{background:linear-gradient(90deg,#eab84b,#d69e2e)}.quota-legend{display:flex;gap:16px;justify-content:flex-end;padding:0 0 8px;font-size:11px;color:#718096}.quota-legend i{display:inline-block;width:11px;height:7px;border-radius:4px;margin-right:5px}.quota-legend .used{background:#3974e8}.quota-legend .remaining{background:#dce7f7}
 .baseline-reset{display:flex;align-items:center;gap:8px;margin:-5px 20px 18px;color:#52647b;font-size:12px}.baseline-reset input{width:auto;margin:0}
- button{border:0;border-radius:8px;background:#2463eb;color:white;padding:9px 14px;font-weight:600;cursor:pointer}input{border:1px solid #ccd6e5;border-radius:8px;padding:9px;background:white}.inline,.budget{display:flex;gap:7px}.rates label{font-size:11px;color:#718096}.rates input{display:block;width:78px;padding:6px}.budget input{width:250px}.empty{text-align:center;color:#718096;padding:32px}.foot{text-align:center;color:#718096;padding:26px;font-size:13px}
+button{border:0;border-radius:8px;background:#2463eb;color:white;padding:9px 14px;font-weight:600;cursor:pointer}input{border:1px solid #ccd6e5;border-radius:8px;padding:9px;background:white}.inline,.budget{display:flex;gap:7px}.rates label{font-size:11px;color:#718096}.rates input{display:block;width:78px;padding:6px}.budget input{width:250px}.empty{text-align:center;color:#718096;padding:32px}.foot{text-align:center;color:#718096;padding:26px;font-size:13px}
+.enrollment-form{display:flex;gap:10px;align-items:end;padding:0 20px 20px}.enrollment-form label{flex:1;color:#52647b;font-size:12px}.enrollment-form input{display:block;width:100%;margin-top:5px}.device-actions{display:flex;gap:6px;align-items:center}.device-actions input{min-width:150px}.device-actions button{padding:7px 9px}.danger-button{background:#c53030}.enrollment-code{font:700 34px/1.2 ui-monospace,Consolas,monospace;letter-spacing:5px;text-align:center;background:#eef4ff;color:#173f79;padding:18px;border-radius:12px;margin:20px 0}.button-link{display:block;text-align:center;text-decoration:none;background:#2463eb;color:white;padding:10px 14px;border-radius:8px;font-weight:600}
 .login-body{min-height:100vh;display:grid;place-items:center;background:linear-gradient(135deg,#edf4ff,#f8fbff)}.login-card{width:min(390px,92vw);padding:30px;background:white;border-radius:18px;box-shadow:0 18px 60px #18375d22}.login-card .muted{color:#718096;margin:8px 0 22px}.login-card label{display:block;margin:14px 0;color:#52647b}.login-card input{display:block;width:100%;margin-top:6px}.login-card button{width:100%;margin-top:8px}.error{color:#c53030;background:#fff5f5;padding:10px;border-radius:8px}
 @media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.split,.dashboard-grid{grid-template-columns:1fr}.panel-head{align-items:flex-start;flex-direction:column}.budget{width:100%}.budget input{flex:1}main{padding:14px}.toolbar{align-items:flex-start;flex-direction:column}.date-filter{width:100%;overflow:auto}.quota-strip{grid-template-columns:1fr 1fr}.quota-strip p{grid-column:1/3;text-align:left}.control-form{grid-template-columns:repeat(2,1fr)}.mode-options,.official-mode,.manual-fields{grid-column:1/3}.control-form .check{grid-column:1/3}}
 @media(max-width:520px){header{align-items:flex-start;flex-direction:column;padding:18px 24px}.identity{justify-content:flex-end;margin-top:12px;width:100%}.date-filter label{min-width:130px}.quota-strip{grid-template-columns:1fr}.quota-strip p{grid-column:auto}.control-form{grid-template-columns:1fr}.mode-options,.official-mode,.manual-fields,.control-form .check{grid-column:auto}.mode-options,.manual-fields{grid-template-columns:1fr}.line-chart{overflow:auto}.line-chart svg{min-width:620px}.total-row{grid-template-columns:1fr auto}.total-bar{grid-column:1/3}}
@@ -1499,8 +1874,13 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=19443)
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--credentials", type=Path, required=True)
+    parser.add_argument("--device-bootstrap", type=Path)
     args = parser.parse_args()
     credentials = json.loads(args.credentials.read_text(encoding="utf-8"))
+    device_bootstrap = (
+        json.loads(args.device_bootstrap.read_text(encoding="utf-8"))
+        if args.device_bootstrap is not None else {}
+    )
     admin_username = credentials.get("dashboard_admin_username", credentials.get("dashboard_username", "admin"))
     admin_password = credentials.get("dashboard_admin_password", credentials.get("dashboard_password", ""))
     server = UsageServer(
@@ -1511,6 +1891,7 @@ def main() -> int:
         dashboard_viewer_username=credentials.get("dashboard_viewer_username", admin_username),
         dashboard_viewer_password=credentials.get("dashboard_viewer_password", admin_password),
         session_secret=credentials["session_secret"],
+        device_bootstrap=device_bootstrap,
     )
     server.serve_forever()
     return 0

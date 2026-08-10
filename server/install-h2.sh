@@ -19,6 +19,7 @@ USAGE_PORT="9443"
 USAGE_BACKEND_PORT="19443"
 USAGE_SOURCE="/root/browser-gateway-usage-collector.py"
 USAGE_CREDENTIALS="$CONFIG_ROOT/usage-credentials.json"
+DEVICE_BOOTSTRAP="$CONFIG_ROOT/device-bootstrap.json"
 USAGE_ADMIN_FILE="/root/browser-gateway-usage-admin.json"
 USAGE_VIEWER_FILE="/root/browser-gateway-usage-viewer.json"
 
@@ -186,9 +187,21 @@ dashboard_viewer_password="$(jq -er '.dashboard_viewer_password' "$USAGE_CREDENT
 tmp_credentials="$work_root/client-credentials.json"
 jq --arg usage_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/events" \
    --arg report_token "$report_token" \
-   '.usageCollectorUrl=$usage_url | .usageReportToken=$report_token' \
+   --arg dashboard_url "https://${PUBLIC_IP}:${USAGE_PORT}/dashboard" \
+   --arg dashboard_username "$dashboard_viewer_username" \
+   --arg dashboard_password "$dashboard_viewer_password" \
+   '.usageCollectorUrl=$usage_url | .usageReportToken=$report_token |
+    .dashboardUrl=$dashboard_url | .dashboardUsername=$dashboard_username |
+    .dashboardPassword=$dashboard_password | .role="viewer"' \
    "$CREDENTIALS_FILE" > "$tmp_credentials"
 install -o root -g root -m 0600 "$tmp_credentials" "$CREDENTIALS_FILE"
+jq -n --arg host "$PUBLIC_IP" --argjson port "$LISTEN_PORT" \
+  --arg username "$gateway_user" --arg password "$gateway_password" \
+  --arg usage_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/events" \
+  --arg dashboard_url "https://${PUBLIC_IP}:${USAGE_PORT}/dashboard" \
+  '{gateway:{host:$host,port:$port,username:$username,password:$password,expectedIp:$host,transport:"https-h2"},usageCollectorUrl:$usage_url,dashboardUrl:$dashboard_url}' \
+  > "$work_root/device-bootstrap.json"
+install -o root -g browser-gateway -m 0640 "$work_root/device-bootstrap.json" "$DEVICE_BOOTSTRAP"
 jq -n --arg summary_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/summary" \
   --arg dashboard_url "https://${PUBLIC_IP}:${USAGE_PORT}/dashboard" \
   --arg admin_token "$admin_token" --arg dashboard_username "$dashboard_admin_username" \
@@ -392,7 +405,7 @@ Wants=network-online.target
 Type=simple
 User=browser-gateway
 Group=browser-gateway
-ExecStart=/usr/bin/python3 ${APP_ROOT}/bin/usage_collector.py --port ${USAGE_BACKEND_PORT} --database /var/lib/browser-gateway/usage.sqlite3 --credentials ${USAGE_CREDENTIALS}
+ExecStart=/usr/bin/python3 ${APP_ROOT}/bin/usage_collector.py --port ${USAGE_BACKEND_PORT} --database /var/lib/browser-gateway/usage.sqlite3 --credentials ${USAGE_CREDENTIALS} --device-bootstrap ${DEVICE_BOOTSTRAP}
 Restart=always
 RestartSec=2s
 NoNewPrivileges=true

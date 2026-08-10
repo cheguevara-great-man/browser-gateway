@@ -1,6 +1,8 @@
 const elements = Object.fromEntries([
   "stateBadge", "notice", "settingsForm", "host", "port", "username", "password",
   "expectedIp", "saveButton", "control", "egress", "latency", "toggleButton", "testButton",
+  "enrollmentServer", "enrollmentCode", "enrollButton", "dashboardButton", "enrollmentState",
+  "syncBridgeButton",
 ].map((id) => [id, document.getElementById(id)]));
 
 let state = null;
@@ -21,9 +23,10 @@ function showNotice(text = "", error = false) {
 
 function setBusy(value) {
   busy = value;
-  for (const button of [elements.saveButton, elements.toggleButton, elements.testButton]) {
+  for (const button of [elements.saveButton, elements.toggleButton, elements.testButton, elements.enrollButton, elements.syncBridgeButton]) {
     button.disabled = value;
   }
+  elements.dashboardButton.disabled = value || !state?.config.dashboardAvailable;
 }
 
 function render(next, populate = false) {
@@ -34,6 +37,7 @@ function render(next, populate = false) {
     elements.username.value = next.config.username;
     elements.expectedIp.value = next.config.expectedIp;
     elements.password.placeholder = next.config.hasPassword ? "留空保持现有密码" : "请输入服务器密码";
+    elements.enrollmentServer.value = next.config.enrollmentServer || (next.config.host ? `https://${next.config.host}:9443` : "");
   }
   const active = next.active;
   const conflict = next.conflict;
@@ -49,6 +53,11 @@ function render(next, populate = false) {
   elements.toggleButton.classList.toggle("danger", next.config.enabled);
   elements.egress.textContent = next.lastTest?.ip ?? "尚未检测";
   elements.latency.textContent = next.lastTest ? `${next.lastTest.latencyMs} ms` : "—";
+  elements.enrollmentState.textContent = next.config.enrolled
+    ? `${next.config.machineName} · 已注册`
+    : "尚未注册";
+  elements.dashboardButton.disabled = busy || !next.config.dashboardAvailable;
+  elements.syncBridgeButton.hidden = !next.config.enrolled;
   if (conflict) showNotice("Chrome 代理由其他扩展控制。请先关闭 FanVPN 或其他代理扩展。", true);
   else if (next.lastProxyError) showNotice(`${next.lastProxyError.error}: ${next.lastProxyError.details}`, true);
   else showNotice();
@@ -64,13 +73,13 @@ function formConfig() {
   };
 }
 
-async function perform(operation, successText) {
+async function perform(operation, successText, populate = false) {
   if (busy) return;
   setBusy(true);
   try {
     const next = await operation();
     elements.password.value = "";
-    render(next);
+    render(next, populate);
     if (successText) showNotice(successText);
   } catch (error) {
     showNotice(error?.message ?? String(error), true);
@@ -94,6 +103,29 @@ elements.toggleButton.addEventListener("click", () => {
 
 elements.testButton.addEventListener("click", () => {
   perform(() => message({ type: "TEST_CONNECTION" }), "出口检测成功");
+});
+
+elements.enrollButton.addEventListener("click", () => {
+  perform(
+    () => message({
+      type: "ENROLL_DEVICE",
+      server: elements.enrollmentServer.value,
+      code: elements.enrollmentCode.value,
+    }),
+    "设备注册完成，Gateway、用量上报和只读统计均已配置",
+    true,
+  );
+});
+
+elements.dashboardButton.addEventListener("click", () => {
+  perform(async () => {
+    await message({ type: "OPEN_DASHBOARD" });
+    return message({ type: "GET_STATE" });
+  });
+});
+
+elements.syncBridgeButton.addEventListener("click", () => {
+  perform(() => message({ type: "SYNC_BRIDGE_CONFIG" }), "AI Bridge 用量配置已重新同步");
 });
 
 setBusy(true);

@@ -18,6 +18,7 @@ let lastProxyError = null;
 let lastTest = null;
 let restorePromise = null;
 const AUTH_PRIME_URL = "https://api.ipify.org/?browser-gateway-auth-prime=1";
+const BRIDGE_EXTENSION_ID = "bgpbajocpomglgdffkgcklhepbcfpbfd";
 
 function currentConfig() {
   if (!configPromise) {
@@ -148,12 +149,106 @@ async function testConnection() {
   }
 }
 
+function normalizeEnrollmentServer(value) {
+  const raw = String(value ?? "").trim().replace(/\/$/, "");
+  const parsed = new URL(raw);
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("注册服务器必须是 HTTPS 地址");
+  }
+  return parsed.origin;
+}
+
+async function applyBridgeDeviceConfig(config) {
+  if (!config.machineId || !config.deviceToken || !config.usageCollectorUrl) {
+    throw new Error("设备尚未完成注册");
+  }
+  const response = await chrome.runtime.sendMessage(BRIDGE_EXTENSION_ID, {
+    kind: "device-config:apply",
+    config: {
+      machineId: config.machineId,
+      machineName: config.machineName,
+      reportToken: config.deviceToken,
+      collectorUrl: config.usageCollectorUrl,
+      dashboardUrl: config.dashboardUrl,
+    },
+  });
+  if (response?.ok !== true) {
+    throw new Error(response?.message || "FanVPN AI Bridge 未接受设备配置");
+  }
+  return response;
+}
+
+async function enrollDevice(serverValue, codeValue) {
+  const enrollmentServer = normalizeEnrollmentServer(serverValue);
+  const code = String(codeValue ?? "").trim().toUpperCase();
+  if (!/^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(code)) throw new Error("注册码格式不正确");
+  const previous = await currentConfig();
+  let machineId = previous.machineId || "";
+  if (!machineId) {
+    try {
+      const bridgeState = await chrome.runtime.sendMessage(
+        BRIDGE_EXTENSION_ID, { kind: "device-config:get" },
+      );
+      if (bridgeState?.ok === true && typeof bridgeState?.state?.machine_id === "string") {
+        machineId = bridgeState.state.machine_id;
+      }
+    } catch {
+      // A newly installed machine has no Bridge usage identity to preserve.
+    }
+  }
+  const response = await fetch(`${enrollmentServer}/v1/enrollment/redeem`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code, machine_id: machineId }),
+  });
+  if (!response.ok) throw new Error(response.status === 400 ? "注册码无效或已过期" : `注册服务器返回 HTTP ${response.status}`);
+  const result = await response.json();
+  const gateway = result.gateway ?? {};
+  const next = normalizeConfig({
+    ...previous,
+    host: gateway.host,
+    port: gateway.port,
+    username: gateway.username,
+    password: gateway.password,
+    expectedIp: gateway.expectedIp,
+    enrollmentServer,
+    machineId: result.machineId,
+    machineName: result.machineName,
+    deviceToken: result.deviceToken,
+    usageCollectorUrl: result.usageCollectorUrl,
+    dashboardUrl: result.dashboardUrl,
+  }, previous);
+  await replaceConfig(next);
+  if (next.enabled) await enableProxy(chrome.proxy.settings, next);
+  await applyBridgeDeviceConfig(next);
+  return statusPayload();
+}
+
+async function openDashboard() {
+  const config = await currentConfig();
+  if (!config.dashboardUrl || !config.deviceToken) throw new Error("设备尚未完成注册");
+  const origin = new URL(config.dashboardUrl).origin;
+  const response = await fetch(`${origin}/v1/device/session`, {
+    method: "POST",
+    cache: "no-store",
+    headers: { authorization: `Bearer ${config.deviceToken}` },
+  });
+  if (!response.ok) throw new Error(`无法创建只读网页会话：HTTP ${response.status}`);
+  const result = await response.json();
+  await chrome.tabs.create({ url: result.loginUrl });
+  return { ok: true };
+}
+
 async function handleMessage(message) {
   switch (message?.type) {
     case "GET_STATE": return statusPayload();
     case "SAVE_CONFIG": return updateConfig(message.config ?? {});
     case "SET_ENABLED": return setEnabled(Boolean(message.enabled));
     case "TEST_CONNECTION": return testConnection();
+    case "ENROLL_DEVICE": return enrollDevice(message.server, message.code);
+    case "SYNC_BRIDGE_CONFIG": await applyBridgeDeviceConfig(await currentConfig()); return statusPayload();
+    case "OPEN_DASHBOARD": return openDashboard();
     default: throw new Error("未知的插件操作");
   }
 }

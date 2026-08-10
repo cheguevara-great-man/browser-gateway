@@ -50,31 +50,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\deploy-server.ps1 `
   -Server '<服务器 IP>' `
   -IdentityFile "$HOME\.ssh\browser_gateway_ed25519" `
   -LocalCredentialPath "$HOME\.browser-gateway\deployment.local.json" `
-  -UsageViewerCredentialPath "$HOME\.browser-gateway\usage-viewer.local.json" `
   -UsageAdminCredentialPath "$HOME\.browser-gateway\usage-admin.local.json"
 ```
 
 脚本可重复运行：保留现有代理和上报 Token、迁移数据库、新增缺失字段、更新程序并重启服务。
 Bridge 2.7/2.8 已排队事件继续兼容。
 
-## 三类凭据
+## 设备身份与网页管理员
 
 ### `deployment.local.json`
 
-分发给每台需要使用 Gateway 和上报的电脑，包含代理凭据、`usageCollectorUrl` 和
-`usageReportToken`。上报 Token 只能写入事件，不能读取汇总。
-
-### `usage-viewer.local.json`
-
-可分发给六台需要查看数据的电脑，只包含网页 URL 和只读账号密码。只读账号可访问全部统计页面，
-但修改预算或费率会返回 `403 administrator_required`。
+服务器部署和旧版客户端的兼容文件，包含代理、用量上报和只读网页信息。新设备不再分发这个文件，
+而是使用网站生成的一次性注册码。每台注册设备获得独立设备 Token，可以使用 Gateway、上报本机
+用量并只读查看全部统计，但不能修改服务器设置。
 
 ### `usage-admin.local.json`
 
-只保留在管理电脑。它包含管理员网页账号密码和 Bearer `adminToken`，能修改预算、费率并调用
-`/v1/usage/summary`。不要把该文件作为普通机器配置分发。
+服务器部署时生成的应急凭据，包含管理员网页账号密码和 Bearer `adminToken`。管理员不绑定某台
+电脑：在任意电脑使用管理员账号登录网页，都可以修改预算、费率和设备。不要把管理员凭据写入
+设备配置或发送给普通使用者。
 
-部署脚本会为三个本地文件设置仅当前 Windows 用户可读写的 ACL；这些文件不会进入 Git。
+旧版 `usage-viewer.local.json` 仍可选择导出，但已不再需要日常分发。部署脚本会为本地凭据设置仅
+当前 Windows 用户可读写的 ACL；这些文件不会进入 Git。
+
+## 从网页添加设备（推荐）
+
+1. 使用管理员账号登录 `/dashboard`，进入“设备额度”。
+2. 在“添加设备”中填写名称，生成十分钟有效且只能使用一次的注册码。
+3. 确认 Browser Gateway 扩展为 `0.3.0+`、FanVPN AI Bridge 与 Native Host 为 `3.4.0+`；在目标
+   电脑打开 Browser Gateway 插件，确认“统计服务器”，输入注册码并点击“注册这台设备”。
+4. 插件自动保存 Gateway 配置，并把同一设备身份同步给 FanVPN AI Bridge Native Host。
+5. 点击“打开用量统计”会创建一次性的只读网页登录票据，不需要输入或保存 viewer 密码。
+
+所有电脑的设备权限完全相同。网站管理员权限只由网页账号决定，不存在“管理员电脑”。设备页面可
+改名、停用、恢复或撤销单台设备的上报与只读身份；撤销后必须使用新的注册码重新注册。当前 Gateway
+代理仍沿用服务器统一生成的代理账号，设备身份停用不等于撤销已经保存在 Chrome 中的代理密码。
 
 ## 网页页面
 
@@ -113,6 +123,23 @@ CSRF Token。登录失败有固定延迟，Nginx 对公网请求限速。
 
 ## API
 
+### 一次性设备注册
+
+管理员在网页生成注册码；目标插件随后兑换：
+
+```http
+POST /v1/enrollment/redeem
+Content-Type: application/json
+
+{"code":"ABCD-2345","machine_id":"可选的既有机器 UUID"}
+```
+
+注册码只有约 40 bit 随机空间但仅十分钟有效、单次使用，并由公网 Nginx 限速。兑换后服务器只保存
+设备 Token 的 SHA-256，不保存明文。响应包含该设备所需的 Gateway、上报和只读网页配置。
+
+设备需要打开统计网页时，先用自己的 Bearer Token 调用 `POST /v1/device/session`，再打开返回的
+两分钟有效、只能使用一次的 `loginUrl`。该流程只产生 viewer 会话，不能升级为管理员。
+
 ### 上报
 
 ```http
@@ -131,7 +158,8 @@ GET  /v1/usage/policy?machine_id=<机器ID>
 Authorization: Bearer <report token>
 ```
 
-普通机器只能提交固定结构的额度快照，并读取自身是否达到配置上限；不能读取全体明细或修改策略。
+设备只能提交固定结构的额度快照，并读取自身是否达到配置上限；设备 Token 还可以只读获取汇总，
+但不能修改策略。
 
 ### 汇总
 
@@ -163,7 +191,7 @@ sqlite3 /var/lib/browser-gateway/usage.sqlite3 'select count(*) from usage_event
 
 ## 安全与隐私
 
-- 普通机器没有读取汇总或修改配置的权限；
+- 已注册设备可以只读查看汇总，但没有修改配置的权限；
 - 不接收提示词、回复、文件、Cookie、账号 Token 或 API Key；
 - 固定事件字段和长度上限阻止把服务当成任意数据存储；
 - systemd 使用无登录权限用户、只读系统目录和内存限制；

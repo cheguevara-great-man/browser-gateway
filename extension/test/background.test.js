@@ -16,6 +16,8 @@ function createChrome(initialConfig = null) {
   let proxySetCount = 0;
   const runtimeMessage = new FakeEvent();
   const authRequired = new FakeEvent();
+  const externalMessages = [];
+  const openedTabs = [];
   return {
     storage: {
       local: {
@@ -29,6 +31,11 @@ function createChrome(initialConfig = null) {
       onInstalled: new FakeEvent(),
       onStartup: new FakeEvent(),
       onMessage: runtimeMessage,
+      async sendMessage(extensionId, message) {
+        externalMessages.push({ extensionId, message });
+        if (message.kind === "device-config:get") return { ok: true, state: { configured: false } };
+        return { ok: true, state: { configured: true, restart_required: true } };
+      },
     },
     proxy: {
       settings: {
@@ -50,7 +57,10 @@ function createChrome(initialConfig = null) {
       onCompleted: new FakeEvent(),
       onErrorOccurred: new FakeEvent(),
     },
+    tabs: { async create(value) { openedTabs.push(value); } },
     __events: { runtimeMessage, authRequired },
+    __externalMessages: externalMessages,
+    __openedTabs: openedTabs,
     __proxySetCount() { return proxySetCount; },
   };
 }
@@ -99,6 +109,37 @@ test("background saves credentials, controls the proxy, authenticates narrowly, 
   const disabled = await send(listener, { type: "SET_ENABLED", enabled: false });
   assert.equal(disabled.config.enabled, false);
   assert.equal(disabled.active, false);
+});
+
+test("one-time enrollment configures Gateway and sends scoped usage identity to Bridge", async () => {
+  globalThis.chrome = createChrome();
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith("runtime-config.json")) return { ok: false };
+    if (String(url).endsWith("/v1/enrollment/redeem")) {
+      assert.equal(JSON.parse(options.body).code, "ABCD-2345");
+      return { ok: true, async json() { return {
+        machineId: "11111111-1111-4111-8111-111111111111",
+        machineName: "公司电脑-03",
+        deviceToken: "device-token-secret-1234567890",
+        usageCollectorUrl: "https://203.0.113.10:9443/v1/usage/events",
+        dashboardUrl: "https://203.0.113.10:9443/dashboard",
+        gateway: { host: "203.0.113.10", port: 443, username: "gateway-device", password: "proxy-secret", expectedIp: "203.0.113.10" },
+      }; } };
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  await import(`../src/background.js?enroll=${Date.now()}`);
+  const listener = chrome.__events.runtimeMessage.listeners[0];
+  const result = await send(listener, {
+    type: "ENROLL_DEVICE", server: "https://203.0.113.10:9443", code: "ABCD-2345",
+  });
+  assert.equal(result.config.enrolled, true);
+  assert.equal(result.config.machineName, "公司电脑-03");
+  assert.equal(result.config.hasPassword, true);
+  assert.equal("deviceToken" in result.config, false);
+  const applied = chrome.__externalMessages.find(({ message }) => message.kind === "device-config:apply");
+  assert.equal(applied.extensionId, "bgpbajocpomglgdffkgcklhepbcfpbfd");
+  assert.equal(applied.message.config.machineName, "公司电脑-03");
 });
 
 test("cold startup restores the proxy once and serves stored credentials", async () => {

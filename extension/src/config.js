@@ -7,6 +7,12 @@ export const DEFAULT_CONFIG = Object.freeze({
   password: "",
   expectedIp: "38.207.167.51",
   enabled: false,
+  enrollmentServer: "",
+  machineId: "",
+  machineName: "",
+  deviceToken: "",
+  usageCollectorUrl: "",
+  dashboardUrl: "",
 });
 
 function normalizeHost(value) {
@@ -55,6 +61,12 @@ export function normalizeConfig(value = {}, previous = DEFAULT_CONFIG) {
     password,
     expectedIp: normalizeCredential(value.expectedIp ?? previous.expectedIp, "出口 IP", 253).trim(),
     enabled: Boolean(value.enabled ?? previous.enabled),
+    enrollmentServer: normalizeCredential(value.enrollmentServer ?? previous.enrollmentServer, "注册服务器", 512).trim().replace(/\/$/, ""),
+    machineId: normalizeCredential(value.machineId ?? previous.machineId, "设备 ID", 64),
+    machineName: normalizeCredential(value.machineName ?? previous.machineName, "设备名称", 128),
+    deviceToken: normalizeCredential(value.deviceToken ?? previous.deviceToken, "设备 Token", 512),
+    usageCollectorUrl: normalizeCredential(value.usageCollectorUrl ?? previous.usageCollectorUrl, "用量地址", 1024),
+    dashboardUrl: normalizeCredential(value.dashboardUrl ?? previous.dashboardUrl, "统计网页", 1024),
   };
 }
 
@@ -72,6 +84,11 @@ export function toPublicConfig(config) {
     expectedIp: config.expectedIp,
     enabled: config.enabled,
     hasPassword: Boolean(config.password),
+    enrollmentServer: config.enrollmentServer,
+    machineId: config.machineId,
+    machineName: config.machineName,
+    enrolled: Boolean(config.machineId && config.deviceToken),
+    dashboardAvailable: Boolean(config.dashboardUrl && config.deviceToken),
   };
 }
 

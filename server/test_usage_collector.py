@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import http.client
+import json
 import tempfile
 import threading
 import time
@@ -208,6 +209,47 @@ class CollectorTests(unittest.TestCase):
         self.assertIsNone(MODULE.validate_session(b"secret", token + "x", now=1_100))
         self.assertIsNone(MODULE.validate_session(b"secret", token, now=50_000))
 
+    def test_one_time_enrollment_issues_scoped_device_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "usage.sqlite3"
+            MODULE.initialize(database)
+            code, expires = MODULE.create_enrollment(database, "公司电脑-03", now=1000)
+            self.assertEqual(expires, 1000 + MODULE.ENROLLMENT_TTL_SECONDS)
+            result = MODULE.redeem_enrollment(
+                database,
+                code,
+                "",
+                {
+                    "gateway": {
+                        "host": "203.0.113.10", "port": 443, "username": "device",
+                        "password": "private", "expectedIp": "203.0.113.10",
+                    },
+                    "usageCollectorUrl": "https://203.0.113.10:9443/v1/usage/events",
+                    "dashboardUrl": "https://203.0.113.10:9443/dashboard",
+                },
+                now=1001,
+            )
+            self.assertEqual(result["machineName"], "公司电脑-03")
+            device = MODULE.authenticate_device(database, result["deviceToken"])
+            self.assertEqual(device["machine_id"], result["machineId"])
+            self.assertEqual(device["machine_name"], "公司电脑-03")
+            with self.assertRaises(ValueError):
+                MODULE.redeem_enrollment(database, code, "", {}, now=1002)
+
+    def test_device_dashboard_ticket_is_single_use(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "usage.sqlite3"
+            MODULE.initialize(database)
+            code, _expires = MODULE.create_enrollment(database, "PC", now=1000)
+            result = MODULE.redeem_enrollment(
+                database, code, "",
+                {"gateway": {}, "usageCollectorUrl": "https://example.test/events", "dashboardUrl": "https://example.test/dashboard"},
+                now=1001,
+            )
+            ticket = MODULE.create_device_session_ticket(database, result["machineId"], now=1002)
+            self.assertTrue(MODULE.consume_device_session_ticket(database, ticket, now=1003))
+            self.assertFalse(MODULE.consume_device_session_ticket(database, ticket, now=1004))
+
     def test_fast_mode_applies_official_model_multiplier(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "usage.sqlite3"
@@ -331,6 +373,59 @@ class CollectorTests(unittest.TestCase):
                 response = connection.getresponse()
                 self.assertEqual(response.status, 403)
                 self.assertIn("administrator_required", response.read().decode("utf-8"))
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_device_enrollment_http_flow_and_read_only_dashboard_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "usage.sqlite3"
+            server = MODULE.UsageServer(
+                ("127.0.0.1", 0), MODULE.Handler, database=database,
+                report_token="legacy-report", admin_token="admin",
+                dashboard_admin_username="admin", dashboard_admin_password="admin-pass",
+                dashboard_viewer_username="viewer", dashboard_viewer_password="viewer-pass",
+                session_secret="session-secret",
+                device_bootstrap={
+                    "gateway": {"host": "203.0.113.10", "port": 443, "username": "u", "password": "p", "expectedIp": "203.0.113.10"},
+                    "usageCollectorUrl": "https://203.0.113.10:9443/v1/usage/events",
+                    "dashboardUrl": "https://203.0.113.10:9443/dashboard",
+                },
+            )
+            code, _expires = MODULE.create_enrollment(database, "PC-HTTP")
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            try:
+                body = json.dumps({"code": code, "machine_id": ""})
+                connection.request("POST", "/v1/enrollment/redeem", body, {"Content-Type": "application/json"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                enrollment = json.loads(response.read())
+                token = enrollment["deviceToken"]
+
+                event = self.event("device-event")
+                event["machine_id"] = enrollment["machineId"]
+                event["machine_name"] = enrollment["machineName"]
+                connection.request(
+                    "POST", "/v1/usage/events", json.dumps(event),
+                    {"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 202)
+                response.read()
+
+                connection.request("GET", "/v1/usage/summary?days=30", headers={"Authorization": f"Bearer {token}"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["totals"]["requests"], 1)
+
+                connection.request("POST", "/v1/device/session", b"", {"Authorization": f"Bearer {token}"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertIn("/device-login?ticket=", json.loads(response.read())["loginUrl"])
             finally:
                 connection.close()
                 server.shutdown()
