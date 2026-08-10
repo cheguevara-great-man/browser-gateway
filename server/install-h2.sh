@@ -21,7 +21,6 @@ USAGE_SOURCE="/root/browser-gateway-usage-collector.py"
 USAGE_CREDENTIALS="$CONFIG_ROOT/usage-credentials.json"
 DEVICE_BOOTSTRAP="$CONFIG_ROOT/device-bootstrap.json"
 USAGE_ADMIN_FILE="/root/browser-gateway-usage-admin.json"
-USAGE_VIEWER_FILE="/root/browser-gateway-usage-viewer.json"
 
 fail() { echo "browser-gateway: $*" >&2; exit 1; }
 
@@ -208,10 +207,7 @@ jq -n --arg summary_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/summary" \
   --arg dashboard_password "$dashboard_admin_password" \
   '{summaryUrl:$summary_url,adminToken:$admin_token,dashboardUrl:$dashboard_url,dashboardUsername:$dashboard_username,dashboardPassword:$dashboard_password,role:"admin"}' > "$USAGE_ADMIN_FILE"
 chmod 0600 "$USAGE_ADMIN_FILE"
-jq -n --arg dashboard_url "https://${PUBLIC_IP}:${USAGE_PORT}/dashboard" \
-  --arg dashboard_username "$dashboard_viewer_username" --arg dashboard_password "$dashboard_viewer_password" \
-  '{dashboardUrl:$dashboard_url,dashboardUsername:$dashboard_username,dashboardPassword:$dashboard_password,role:"viewer"}' > "$USAGE_VIEWER_FILE"
-chmod 0600 "$USAGE_VIEWER_FILE"
+rm -f /root/browser-gateway-usage-viewer.json
 install -o root -g root -m 0755 "$USAGE_SOURCE" "$APP_ROOT/bin/usage_collector.py"
 
 install -d -m 0755 /usr/local/libexec
@@ -528,4 +524,3 @@ ss -ltnH "sport = :${USAGE_BACKEND_PORT}" | grep -q . || fail "usage collector b
 echo "Browser Gateway HTTP/2 installed on TCP ${LISTEN_PORT}."
 echo "Credentials remain in ${CREDENTIALS_FILE}."
 echo "Usage administrator credentials remain in ${USAGE_ADMIN_FILE}."
-echo "Usage read-only credentials remain in ${USAGE_VIEWER_FILE}."
