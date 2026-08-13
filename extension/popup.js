@@ -70,7 +70,7 @@ function render(next, populate = false) {
   elements.syncBridgeButton.hidden = !next.config.enrolled;
   if (conflict) showNotice("Chrome 代理由其他扩展控制。请先关闭 FanVPN 或其他代理扩展。", true);
   else if (next.lastProxyError) showNotice(`${next.lastProxyError.error}: ${next.lastProxyError.details}`, true);
-  else if (next.config.routingMode === "rule") showNotice("规则模式：常用国内站点、本地和内网地址直连；其他网站走美国服务器。");
+  else if (next.config.routingMode === "rule") showNotice("规则模式：中国大陆 IPv4、本地和内网地址直连；其他网站走美国服务器。");
   else if (next.config.routingMode === "direct") showNotice("直连模式不使用 Browser Gateway，也不会沿用系统代理。");
   else showNotice();
 }

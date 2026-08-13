@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, assertReady, normalizeConfig, toPublicConfig } from "../src/config.js";
+import { CHINA_IPV4_RANGES } from "../src/china-ipv4-ranges.js";
 
 test("normalizes a valid gateway configuration", () => {
   const config = normalizeConfig({
@@ -18,6 +19,13 @@ test("uses rule mode for fresh installs but preserves global behavior for old en
   assert.equal(normalizeConfig({ enabled: true }).routingMode, "global");
   assert.equal(normalizeConfig({ routingMode: "direct" }).routingMode, "direct");
   assert.throws(() => normalizeConfig({ routingMode: "invalid" }), /代理模式/);
+});
+
+test("ships a substantial, sorted Chinese IPv4 routing table", () => {
+  assert.ok(CHINA_IPV4_RANGES.length > 2000);
+  for (let index = 1; index < CHINA_IPV4_RANGES.length; index += 1) {
+    assert.ok(CHINA_IPV4_RANGES[index - 1][1] < CHINA_IPV4_RANGES[index][0]);
+  }
 });
 
 test("preserves an existing password when the form leaves it blank", () => {

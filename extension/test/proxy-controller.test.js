@@ -16,18 +16,27 @@ test("builds an HTTPS proxy while bypassing loopback", () => {
   assert.ok(value.rules.bypassList.includes("localhost"));
 });
 
-test("builds a local PAC for rule mode and never sends domestic suffixes through the gateway", () => {
+test("builds a local PAC that resolves and binary-searches Chinese IPv4 ranges", () => {
   const config = { host: "38.207.167.51", port: 443, routingMode: "rule" };
   const value = buildProxyValue(config);
   assert.equal(value.mode, "pac_script");
   assert.equal(value.pacScript.data, buildRulePac(config));
-  assert.match(value.pacScript.data, /dnsDomainIs\(host, "\.cn"\)/);
-  assert.match(value.pacScript.data, /dnsDomainIs\(host, "\.baidu\.com"\)/);
+  assert.match(value.pacScript.data, /var CN_IPV4_RANGES = \[\[/);
+  assert.match(value.pacScript.data, /var address = dnsResolve\(host\)/);
+  assert.match(value.pacScript.data, /while \(low <= high\)/);
   assert.match(value.pacScript.data, /HTTPS 38\.207\.167\.51:443/);
   assert.equal(isConfiguredProxy({
     levelOfControl: "controlled_by_this_extension",
     value,
   }, config), true);
+
+  const findProxyFor = new Function("dnsResolve", "isPlainHostName", "shExpMatch", `${value.pacScript.data}\nreturn FindProxyForURL;`)(
+    (host) => ({ "www.baidu.com": "110.242.68.66", "dns.google": "8.8.8.8" }[host]),
+    (host) => !host.includes("."),
+    (host, pattern) => pattern.startsWith("*.") && host.endsWith(pattern.slice(1)),
+  );
+  assert.equal(findProxyFor("https://www.baidu.com", "www.baidu.com"), "DIRECT");
+  assert.equal(findProxyFor("https://dns.google", "dns.google"), "HTTPS 38.207.167.51:443");
 });
 
 test("uses Chrome direct mode without contacting the gateway", () => {

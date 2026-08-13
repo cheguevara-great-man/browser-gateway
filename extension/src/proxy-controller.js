@@ -1,3 +1,5 @@
+import { CHINA_IPV4_RANGES } from "./china-ipv4-ranges.js";
+
 const BYPASS_LIST = Object.freeze([
   "127.0.0.1",
   "localhost",
@@ -5,40 +7,49 @@ const BYPASS_LIST = Object.freeze([
   "<local>",
 ]);
 
-// PAC cannot ask Chrome for a country code. Rule mode therefore keeps the
-// decision local: common domestic suffixes are sent DIRECT, while everything
-// else uses the private gateway. Users can still select Global when they want
-// every public destination to use the US egress.
-const DIRECT_DOMAIN_SUFFIXES = Object.freeze([
-  "cn", "中国", "公司", "网络", "公益", "政务", "移动", "我爱你", "在线", "中文网",
-  "baidu.com", "bdimg.com", "bcebos.com", "bilibili.com", "bilibili.tv", "alipay.com",
-  "taobao.com", "tmall.com", "alicdn.com", "alibaba.com", "aliyun.com", "jd.com",
-  "360.cn", "360.com", "so.com", "qq.com", "qpic.cn", "gtimg.com", "weixin.qq.com",
-  "weixin.com", "sina.com.cn", "weibo.com", "zhihu.com", "douban.com", "douyin.com",
-  "kuaishou.com", "163.com", "126.com", "yeah.net", "netease.com", "meituan.com",
-  "dianping.com", "ctrip.com", "c-ctrip.com", "qunar.com", "ifeng.com", "sogou.com",
-  "sm.cn", "xiaomi.com", "mi.com", "huawei.com", "hicloud.com", "oppo.com", "vivo.com",
-  "bytedance.com", "byteimg.com", "toutiao.com", "csdn.net", "cnblogs.com", "gitee.com",
-  "oschina.net", "eastmoney.com", "sse.com.cn", "szse.cn", "gov.cn", "edu.cn",
-]);
-
-function pacDomainConditions() {
-  return DIRECT_DOMAIN_SUFFIXES
-    .map((suffix) => `host === ${JSON.stringify(suffix)} || dnsDomainIs(host, ${JSON.stringify(`.${suffix}`)})`)
-    .join(" || ");
-}
+const rulePacCache = new Map();
 
 export function buildRulePac(config) {
+  const cacheKey = `${config.host}:${config.port}`;
+  const cached = rulePacCache.get(cacheKey);
+  if (cached) return cached;
   const proxy = `HTTPS ${config.host}:${config.port}`;
-  return [
+  const pac = [
+    `var CN_IPV4_RANGES = ${JSON.stringify(CHINA_IPV4_RANGES)};`,
+    "function ipv4ToNumber(address) {",
+    "  var parts = address.split('.');",
+    "  if (parts.length !== 4) return -1;",
+    "  var value = 0;",
+    "  for (var index = 0; index < 4; index += 1) {",
+    "    var octet = parseInt(parts[index], 10);",
+    "    if (isNaN(octet) || octet < 0 || octet > 255 || String(octet) !== parts[index]) return -1;",
+    "    value = value * 256 + octet;",
+    "  }",
+    "  return value;",
+    "}",
+    "function shouldDirectIpv4(address) {",
+    "  var value = ipv4ToNumber(address);",
+    "  if (value < 0) return false;",
+    "  if ((value >= 2130706432 && value <= 2147483647) || (value >= 167772160 && value <= 184549375) || (value >= 2886729728 && value <= 2887778303) || (value >= 3232235520 && value <= 3232301055) || (value >= 2851995648 && value <= 2852061183)) return true;",
+    "  var low = 0; var high = CN_IPV4_RANGES.length - 1;",
+    "  while (low <= high) {",
+    "    var middle = Math.floor((low + high) / 2); var range = CN_IPV4_RANGES[middle];",
+    "    if (value < range[0]) high = middle - 1;",
+    "    else if (value > range[1]) low = middle + 1;",
+    "    else return true;",
+    "  }",
+    "  return false;",
+    "}",
     "function FindProxyForURL(url, host) {",
     "  host = (host || '').toLowerCase();",
     "  if (isPlainHostName(host) || shExpMatch(host, '*.local') || shExpMatch(host, '*.localhost')) return 'DIRECT';",
-    "  if (isInNet(host, '127.0.0.0', '255.0.0.0') || isInNet(host, '10.0.0.0', '255.0.0.0') || isInNet(host, '172.16.0.0', '255.240.0.0') || isInNet(host, '192.168.0.0', '255.255.0.0') || isInNet(host, '169.254.0.0', '255.255.0.0')) return 'DIRECT';",
-    `  if (${pacDomainConditions()}) return 'DIRECT';`,
+    "  var address = dnsResolve(host);",
+    "  if (address && shouldDirectIpv4(address)) return 'DIRECT';",
     `  return ${JSON.stringify(proxy)};`,
     "}",
   ].join("\n");
+  rulePacCache.set(cacheKey, pac);
+  return pac;
 }
 
 function invokeChromeSetting(method, details) {

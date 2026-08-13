@@ -90,7 +90,10 @@ try {
   assert.ok(checks[0]?.status() < 500, `GitHub returned ${checks[0]?.status()}`);
   assert.ok(checks[1]?.status() < 500, `ChatGPT returned ${checks[1]?.status()}`);
   assert.equal(checks[2]?.status(), 200, `Google returned ${checks[2]?.status()}`);
-  assert.equal(checks[3]?.status(), 200, `Gemini returned ${checks[3]?.status()}`);
+  // Gemini commonly rate-limits a fresh automated Chromium profile with 429.
+  // A non-5xx response still proves that Chrome reached Google through the
+  // configured proxy; requiring 200 made this network-path check flaky.
+  assert.ok(checks[3]?.status() < 500, `Gemini returned ${checks[3]?.status()}`);
 
   await context.close();
   context = null;
