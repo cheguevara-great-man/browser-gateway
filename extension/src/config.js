@@ -1,4 +1,5 @@
 export const STORAGE_KEY = "gatewayConfig";
+export const ROUTING_MODES = Object.freeze(["rule", "global", "direct"]);
 
 export const DEFAULT_CONFIG = Object.freeze({
   host: "38.207.167.51",
@@ -7,6 +8,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   password: "",
   expectedIp: "38.207.167.51",
   enabled: false,
+  routingMode: "rule",
   enrollmentServer: "",
   machineId: "",
   machineName: "",
@@ -48,11 +50,25 @@ function normalizeCredential(value, label, maximum) {
   return result;
 }
 
+function normalizeRoutingMode(value, fallback) {
+  const mode = String(value ?? fallback ?? "rule").trim().toLowerCase();
+  if (!ROUTING_MODES.includes(mode)) {
+    throw new Error("代理模式必须是规则模式、全局模式或直连模式");
+  }
+  return mode;
+}
+
 export function normalizeConfig(value = {}, previous = DEFAULT_CONFIG) {
   const passwordInput = value.password;
   const password = passwordInput === undefined || passwordInput === ""
     ? String(previous.password ?? "")
     : normalizeCredential(passwordInput, "密码", 512);
+
+  // Older installations used a fixed proxy and therefore behaved as global
+  // mode. Preserve that behavior during the one-time storage migration.
+  const routingMode = value.routingMode === undefined
+    ? (Object.hasOwn(value, "enabled") && Boolean(value.enabled) ? "global" : previous.routingMode)
+    : value.routingMode;
 
   return {
     host: normalizeHost(value.host ?? previous.host),
@@ -61,6 +77,7 @@ export function normalizeConfig(value = {}, previous = DEFAULT_CONFIG) {
     password,
     expectedIp: normalizeCredential(value.expectedIp ?? previous.expectedIp, "出口 IP", 253).trim(),
     enabled: Boolean(value.enabled ?? previous.enabled),
+    routingMode: normalizeRoutingMode(routingMode, previous.routingMode),
     enrollmentServer: normalizeCredential(value.enrollmentServer ?? previous.enrollmentServer, "注册服务器", 512).trim().replace(/\/$/, ""),
     machineId: normalizeCredential(value.machineId ?? previous.machineId, "设备 ID", 64),
     machineName: normalizeCredential(value.machineName ?? previous.machineName, "设备名称", 128),
@@ -83,6 +100,7 @@ export function toPublicConfig(config) {
     username: config.username,
     expectedIp: config.expectedIp,
     enabled: config.enabled,
+    routingMode: config.routingMode,
     hasPassword: Boolean(config.password),
     enrollmentServer: config.enrollmentServer,
     machineId: config.machineId,

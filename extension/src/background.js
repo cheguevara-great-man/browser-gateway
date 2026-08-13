@@ -38,9 +38,14 @@ async function replaceConfig(next) {
 }
 
 function sameProxyChallenge(details, config) {
+  if (config.routingMode === "direct") return false;
   if (!details.isProxy || !details.challenger) return false;
   const host = String(details.challenger.host ?? "").replace(/^\[|\]$/g, "").toLowerCase();
   return host === config.host.toLowerCase() && Number(details.challenger.port) === config.port;
+}
+
+function assertModeReady(config) {
+  if (config.routingMode !== "direct") assertReady(config);
 }
 
 chrome.webRequest.onAuthRequired.addListener(
@@ -97,7 +102,7 @@ async function statusPayload() {
 async function setEnabled(enabled) {
   let config = await currentConfig();
   if (enabled) {
-    assertReady(config);
+    assertModeReady(config);
     await enableProxy(chrome.proxy.settings, config);
     lastProxyError = null;
   } else {
@@ -110,7 +115,7 @@ async function setEnabled(enabled) {
 async function updateConfig(values) {
   const previous = await currentConfig();
   const next = normalizeConfig({ ...values, enabled: previous.enabled }, previous);
-  assertReady(next);
+  assertModeReady(next);
   await replaceConfig(next);
   if (next.enabled) await enableProxy(chrome.proxy.settings, next);
   return statusPayload();
@@ -118,7 +123,7 @@ async function updateConfig(values) {
 
 async function testConnection() {
   const config = await currentConfig();
-  assertReady(config);
+  assertModeReady(config);
   if (!config.enabled) throw new Error("请先开启代理");
   const proxy = await getProxyState(chrome.proxy.settings);
   if (!isConfiguredProxy(proxy, config)) throw new Error("插件当前没有控制 Chrome 代理");
@@ -134,11 +139,13 @@ async function testConnection() {
     if (!response.ok) throw new Error(`出口检查返回 HTTP ${response.status}`);
     const body = await response.json();
     const ip = String(body.ip ?? "");
-    const matchesExpected = !config.expectedIp || ip === config.expectedIp;
+    const usesGateway = config.routingMode !== "direct";
+    const matchesExpected = !usesGateway || !config.expectedIp || ip === config.expectedIp;
     lastTest = {
       ok: matchesExpected,
       ip,
-      expectedIp: config.expectedIp,
+      expectedIp: usesGateway ? config.expectedIp : "",
+      routingMode: config.routingMode,
       latencyMs: Math.round(performance.now() - started),
       at: new Date().toISOString(),
     };
@@ -264,11 +271,12 @@ async function restore() {
   const config = await currentConfig();
   if (config.enabled) {
     try {
-      assertReady(config);
+      assertModeReady(config);
       const proxy = await getProxyState(chrome.proxy.settings);
       if (!isConfiguredProxy(proxy, config)) {
         await enableProxy(chrome.proxy.settings, config);
       }
+      if (config.routingMode === "direct") return;
       // Chrome restores tabs, extensions, and WebSockets immediately after
       // startup. Prime its proxy-auth cache with the saved credentials before
       // those restored requests can fall back to the native auth dialog.

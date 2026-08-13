@@ -4,7 +4,15 @@ Browser Gateway 由 Chrome 扩展和服务器端两层网关组成。
 
 ## Chrome 扩展
 
-扩展通过 Chrome 标准 `fixed_servers` API 配置 HTTPS 代理，并通过 `webRequest.onAuthRequired` 仅向已保存的服务器主机和端口提供代理凭据。扩展不会在 Windows 上监听 TCP 端口，也不会修改 Windows 全局代理。
+扩展使用 Chrome 标准代理 API，并通过 `webRequest.onAuthRequired` 仅向已保存的服务器主机和端口提供代理凭据。扩展不会在 Windows 上监听 TCP 端口，也不会修改 Windows 全局代理。
+
+扩展有三种 Chrome 配置：
+
+- **全局模式**：`fixed_servers` HTTPS 代理；除回环/本地地址外都交给 Gateway。
+- **规则模式**：本地 PAC；常用国内域名、本地和内网地址返回 `DIRECT`，其他目标返回 HTTPS Gateway。PAC 在本机执行，不向 Gateway 上传域名列表或浏览记录。
+- **直连模式**：Chrome `direct`；扩展明确绕过 Gateway 和 Windows 系统代理。此模式不触发 Gateway 认证预热。
+
+规则模式只使用随扩展发布的稳定国内域名规则，而非联网下载的动态规则集。这避免了浏览器启动时额外请求第三方规则服务，也使路由行为可审计；代价是少数未涵盖的国内 `.com` 域名会按“其他目标”走 Gateway。
 
 扩展启动时会恢复已保存的代理状态并预热认证缓存。关闭代理时只清除由本扩展设置的 Chrome 代理。
 

@@ -142,6 +142,33 @@ test("one-time enrollment configures Gateway and sends scoped usage identity to 
   assert.equal(applied.message.config.machineName, "公司电脑-03");
 });
 
+test("direct mode controls Chrome without gateway credentials or proxy authentication", async () => {
+  globalThis.chrome = createChrome();
+  globalThis.fetch = async (url) => String(url).endsWith("runtime-config.json")
+    ? { ok: false }
+    : { ok: true, async json() { return { ip: "198.51.100.8" }; } };
+  await import(`../src/background.js?direct=${Date.now()}`);
+
+  const listener = chrome.__events.runtimeMessage.listeners[0];
+  const saved = await send(listener, {
+    type: "SAVE_CONFIG",
+    config: { host: "38.207.167.51", port: 443, routingMode: "direct" },
+  });
+  assert.equal(saved.config.routingMode, "direct");
+  const enabled = await send(listener, { type: "SET_ENABLED", enabled: true });
+  assert.equal(enabled.active, true);
+
+  const authListener = chrome.__events.authRequired.listeners[0];
+  const response = await new Promise((resolve) => authListener({
+    requestId: "direct", isProxy: true, challenger: { host: "38.207.167.51", port: 443 },
+  }, resolve));
+  assert.deepEqual(response, {});
+
+  const tested = await send(listener, { type: "TEST_CONNECTION" });
+  assert.equal(tested.lastTest.ok, true);
+  assert.equal(tested.lastTest.expectedIp, "");
+});
+
 test("cold startup restores the proxy once and serves stored credentials", async () => {
   globalThis.chrome = createChrome({
     host: "38.207.167.51",

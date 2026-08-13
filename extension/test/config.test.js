@@ -9,7 +9,15 @@ test("normalizes a valid gateway configuration", () => {
   assert.equal(config.host, "38.207.167.51");
   assert.equal(config.port, 443);
   assert.equal(config.enabled, true);
+  assert.equal(config.routingMode, "global");
   assertReady(config);
+});
+
+test("uses rule mode for fresh installs but preserves global behavior for old enabled configs", () => {
+  assert.equal(normalizeConfig({}).routingMode, "rule");
+  assert.equal(normalizeConfig({ enabled: true }).routingMode, "global");
+  assert.equal(normalizeConfig({ routingMode: "direct" }).routingMode, "direct");
+  assert.throws(() => normalizeConfig({ routingMode: "invalid" }), /代理模式/);
 });
 
 test("preserves an existing password when the form leaves it blank", () => {
