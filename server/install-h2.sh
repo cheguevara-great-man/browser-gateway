@@ -16,6 +16,7 @@ WEBROOT="/var/www/html"
 POLICY_PORT="18088"
 GEMINI_WARP_SETTINGS="$CONFIG_ROOT/gemini-warp.json"
 USAGE_PORT="9443"
+CODEX_EXECUTOR_PORT="9444"
 USAGE_BACKEND_PORT="19443"
 USAGE_SOURCE="/root/browser-gateway-usage-collector.py"
 USAGE_CREDENTIALS="$CONFIG_ROOT/usage-credentials.json"
@@ -230,7 +231,7 @@ EOF
 chmod 0755 /usr/local/libexec/browser-gateway-refresh-cert
 /usr/local/libexec/browser-gateway-refresh-cert
 
-jq -n --argjson port "$POLICY_PORT" --argjson usage_port "$USAGE_PORT" --arg ip "$PUBLIC_IP" '{
+jq -n --argjson port "$POLICY_PORT" --argjson usage_port "$USAGE_PORT" --argjson codex_executor_port "$CODEX_EXECUTOR_PORT" --arg ip "$PUBLIC_IP" '{
   log:{level:"warn",timestamp:true},
   dns:{servers:[{type:"local",tag:"local"}]},
   inbounds:[{type:"http",tag:"policy-in",listen:"127.0.0.1",listen_port:$port}],
@@ -239,7 +240,7 @@ jq -n --argjson port "$POLICY_PORT" --argjson usage_port "$USAGE_PORT" --arg ip 
     default_domain_resolver:"local",
     rules:[
       {action:"resolve",server:"local"},
-      {ip_cidr:[($ip + "/32")],port:[$usage_port],action:"route",outbound:"direct"},
+      {ip_cidr:[($ip + "/32")],port:[$usage_port,$codex_executor_port],action:"route",outbound:"direct"},
       {ip_cidr:[($ip + "/32")],action:"reject"},
       {ip_is_private:true,action:"reject"},
       {port:[80,443],action:"route",outbound:"direct"},
