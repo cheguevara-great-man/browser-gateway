@@ -484,6 +484,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--credentials", type=Path, required=True)
     parser.add_argument("--usage-module", type=Path, required=True)
+    parser.add_argument("--tls-cert", type=Path)
+    parser.add_argument("--tls-key", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     usage_module = _load_usage_module(args.usage_module)
@@ -493,6 +495,13 @@ def main(argv: list[str] | None = None) -> int:
         credential_store=CredentialStore(args.credentials),
         usage_module=usage_module,
     )
+    if (args.tls_cert is None) != (args.tls_key is None):
+        parser.error("--tls-cert and --tls-key must be supplied together")
+    if args.tls_cert is not None and args.tls_key is not None:
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls_context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
     server.serve_forever()
     return 0
 

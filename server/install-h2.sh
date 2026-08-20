@@ -17,12 +17,8 @@ POLICY_PORT="18088"
 GEMINI_WARP_SETTINGS="$CONFIG_ROOT/gemini-warp.json"
 USAGE_PORT="9443"
 USAGE_BACKEND_PORT="19443"
-CODEX_BACKEND_PORT="19444"
 USAGE_SOURCE="/root/browser-gateway-usage-collector.py"
-CODEX_EXECUTOR_SOURCE="/root/browser-gateway-codex-executor.py"
-CODEX_CREDENTIALS_SOURCE="/root/browser-gateway-codex-credentials.py"
 USAGE_CREDENTIALS="$CONFIG_ROOT/usage-credentials.json"
-CODEX_AUTH_FILE="/var/lib/browser-gateway/codex-auth.json"
 DEVICE_BOOTSTRAP="$CONFIG_ROOT/device-bootstrap.json"
 USAGE_ADMIN_FILE="/root/browser-gateway-usage-admin.json"
 
@@ -52,12 +48,7 @@ fi
 if ss -ltnH "sport = :${USAGE_BACKEND_PORT}" | grep -q . && ! systemctl is-active --quiet browser-gateway-usage.service; then
   fail "local token usage backend port ${USAGE_BACKEND_PORT} is already used by another service"
 fi
-if ss -ltnH "sport = :${CODEX_BACKEND_PORT}" | grep -q . && ! systemctl is-active --quiet browser-gateway-codex.service; then
-  fail "local Codex executor port ${CODEX_BACKEND_PORT} is already used by another service"
-fi
 [[ -s "$USAGE_SOURCE" ]] || fail "usage collector was not uploaded"
-[[ -s "$CODEX_EXECUTOR_SOURCE" ]] || fail "Codex executor was not uploaded"
-[[ -s "$CODEX_CREDENTIALS_SOURCE" ]] || fail "Codex credential module was not uploaded"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -74,8 +65,7 @@ backup="/root/browser-gateway-backups/$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
 backup_items=()
 for item in "$CONFIG_ROOT" /etc/systemd/system/browser-gateway.service \
   /etc/systemd/system/browser-gateway-egress.service \
-  /etc/systemd/system/browser-gateway-usage.service \
-  /etc/systemd/system/browser-gateway-codex.service; do
+  /etc/systemd/system/browser-gateway-usage.service; do
   [[ -e "$item" ]] && backup_items+=("${item#/}")
 done
 if ((${#backup_items[@]})); then
@@ -208,8 +198,7 @@ jq -n --arg host "$PUBLIC_IP" --argjson port "$LISTEN_PORT" \
   --arg username "$gateway_user" --arg password "$gateway_password" \
   --arg usage_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/events" \
   --arg dashboard_url "https://${PUBLIC_IP}:${USAGE_PORT}/dashboard" \
-  --arg codex_executor_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/codex" \
-  '{gateway:{host:$host,port:$port,username:$username,password:$password,expectedIp:$host,transport:"https-h2"},usageCollectorUrl:$usage_url,dashboardUrl:$dashboard_url,codexExecutorUrl:$codex_executor_url}' \
+  '{gateway:{host:$host,port:$port,username:$username,password:$password,expectedIp:$host,transport:"https-h2"},usageCollectorUrl:$usage_url,dashboardUrl:$dashboard_url}' \
   > "$work_root/device-bootstrap.json"
 install -o root -g browser-gateway -m 0640 "$work_root/device-bootstrap.json" "$DEVICE_BOOTSTRAP"
 jq -n --arg summary_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/summary" \
@@ -220,12 +209,6 @@ jq -n --arg summary_url "https://${PUBLIC_IP}:${USAGE_PORT}/v1/usage/summary" \
 chmod 0600 "$USAGE_ADMIN_FILE"
 rm -f /root/browser-gateway-usage-viewer.json
 install -o root -g root -m 0755 "$USAGE_SOURCE" "$APP_ROOT/bin/usage_collector.py"
-install -o root -g root -m 0755 "$CODEX_EXECUTOR_SOURCE" "$APP_ROOT/bin/codex_executor.py"
-install -o root -g root -m 0644 "$CODEX_CREDENTIALS_SOURCE" "$APP_ROOT/bin/codex_credentials.py"
-if [[ -e "$CODEX_AUTH_FILE" ]]; then
-  chown browser-gateway:browser-gateway "$CODEX_AUTH_FILE"
-  chmod 0600 "$CODEX_AUTH_FILE"
-fi
 
 install -d -m 0755 /usr/local/libexec
 cat > /usr/local/libexec/browser-gateway-refresh-cert <<EOF
@@ -300,28 +283,7 @@ server {
   ssl_certificate ${TLS_ROOT}/fullchain.pem;
   ssl_certificate_key ${TLS_ROOT}/privkey.pem;
   ssl_protocols TLSv1.2 TLSv1.3;
-  client_max_body_size 32m;
-  location ^~ /v1/codex/ {
-    limit_req zone=browser_gateway_usage burst=30 nodelay;
-    proxy_pass http://127.0.0.1:${CODEX_BACKEND_PORT};
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header Connection "";
-    proxy_set_header Authorization \$http_authorization;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_connect_timeout 10s;
-    proxy_read_timeout 650s;
-    proxy_request_buffering off;
-    proxy_buffering off;
-  }
-  location = /v1/executor/health {
-    proxy_pass http://127.0.0.1:${CODEX_BACKEND_PORT};
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header Connection "";
-    proxy_connect_timeout 3s;
-    proxy_read_timeout 15s;
-  }
+  client_max_body_size 256k;
   location / {
     limit_req zone=browser_gateway_usage burst=30 nodelay;
     proxy_pass http://127.0.0.1:${USAGE_BACKEND_PORT};
@@ -464,42 +426,6 @@ UMask=0077
 WantedBy=multi-user.target
 EOF
 
-cat > /etc/systemd/system/browser-gateway-codex.service <<EOF
-[Unit]
-Description=Browser Gateway server-side Codex executor
-After=network-online.target browser-gateway-usage.service
-Wants=network-online.target
-Requires=browser-gateway-usage.service
-
-[Service]
-Type=simple
-User=browser-gateway
-Group=browser-gateway
-ExecStart=/usr/bin/python3 ${APP_ROOT}/bin/codex_executor.py --port ${CODEX_BACKEND_PORT} --database /var/lib/browser-gateway/usage.sqlite3 --credentials ${CODEX_AUTH_FILE} --usage-module ${APP_ROOT}/bin/usage_collector.py
-Restart=always
-RestartSec=2s
-NoNewPrivileges=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-ReadWritePaths=/var/lib/browser-gateway
-RestrictSUIDSGID=true
-LockPersonality=true
-RestrictRealtime=true
-RestrictAddressFamilies=AF_INET AF_INET6
-SystemCallArchitectures=native
-CapabilityBoundingSet=
-MemoryMax=192M
-UMask=0077
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
 cat > /usr/local/libexec/browser-gateway-health <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -580,13 +506,6 @@ systemctl enable browser-gateway-egress.service browser-gateway.service browser-
 systemctl restart browser-gateway-egress.service
 systemctl restart browser-gateway.service
 systemctl restart browser-gateway-usage.service
-if [[ -s "$CODEX_AUTH_FILE" ]]; then
-  systemctl enable browser-gateway-codex.service
-  systemctl restart browser-gateway-codex.service
-else
-  systemctl disable --now browser-gateway-codex.service >/dev/null 2>&1 || true
-  echo "Codex executor installed but inactive: upload the server account credentials first."
-fi
 systemctl start browser-gateway-health.timer browser-gateway-cert-renew.timer
 sleep 2
 systemctl is-active --quiet browser-gateway-egress.service || fail "policy egress failed to start"
@@ -598,18 +517,9 @@ systemctl is-active --quiet browser-gateway-usage.service || {
   journalctl -u browser-gateway-usage.service -n 50 --no-pager >&2
   fail "token usage collector failed to start"
 }
-if [[ -s "$CODEX_AUTH_FILE" ]]; then
-  systemctl is-active --quiet browser-gateway-codex.service || {
-    journalctl -u browser-gateway-codex.service -n 50 --no-pager >&2
-    fail "server-side Codex executor failed to start"
-  }
-fi
 ss -ltnH "sport = :${LISTEN_PORT}" | grep -q . || fail "gateway did not bind TCP ${LISTEN_PORT}"
 ss -ltnH "sport = :${USAGE_PORT}" | grep -q . || fail "usage collector did not bind TCP ${USAGE_PORT}"
 ss -ltnH "sport = :${USAGE_BACKEND_PORT}" | grep -q . || fail "usage collector backend did not bind TCP ${USAGE_BACKEND_PORT}"
-if [[ -s "$CODEX_AUTH_FILE" ]]; then
-  ss -ltnH "sport = :${CODEX_BACKEND_PORT}" | grep -q . || fail "Codex executor backend did not bind TCP ${CODEX_BACKEND_PORT}"
-fi
 
 echo "Browser Gateway HTTP/2 installed on TCP ${LISTEN_PORT}."
 echo "Credentials remain in ${CREDENTIALS_FILE}."

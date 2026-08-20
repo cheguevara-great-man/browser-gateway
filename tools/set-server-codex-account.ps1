@@ -31,19 +31,19 @@ if ([string]::IsNullOrWhiteSpace([string]$auth.tokens.access_token) -or
 $ssh = (Get-Command ssh.exe -ErrorAction Stop).Source
 $scp = (Get-Command scp.exe -ErrorAction Stop).Source
 $common = @('-i', $IdentityFile, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes')
-$remoteStaging = '/root/browser-gateway-codex-auth.json.next'
+$remoteStaging = '/root/browser-gateway-codex-executor-auth.json.next'
 
 & $scp @common $AuthFile "root@${Server}:$remoteStaging"
 if ($LASTEXITCODE -ne 0) { throw 'Failed to upload the server Codex credentials.' }
 
 $installCommand = @'
 set -eu
-install -d -o browser-gateway -g browser-gateway -m 0700 /var/lib/browser-gateway
-install -o browser-gateway -g browser-gateway -m 0600 /root/browser-gateway-codex-auth.json.next /var/lib/browser-gateway/codex-auth.json.next
-mv -f /var/lib/browser-gateway/codex-auth.json.next /var/lib/browser-gateway/codex-auth.json
-rm -f /root/browser-gateway-codex-auth.json.next
-systemctl enable --now browser-gateway-codex.service
-systemctl is-active --quiet browser-gateway-codex.service
+install -d -o browser-gateway -g browser-gateway -m 0700 /var/lib/browser-gateway/codex-executor
+install -o browser-gateway -g browser-gateway -m 0600 /root/browser-gateway-codex-executor-auth.json.next /var/lib/browser-gateway/codex-executor/auth.json.next
+mv -f /var/lib/browser-gateway/codex-executor/auth.json.next /var/lib/browser-gateway/codex-executor/auth.json
+rm -f /root/browser-gateway-codex-executor-auth.json.next
+systemctl enable --now browser-gateway-codex-executor.service
+systemctl is-active --quiet browser-gateway-codex-executor.service
 '@ -replace "`r?`n", '; '
 
 & $ssh @common "root@$Server" $installCommand
