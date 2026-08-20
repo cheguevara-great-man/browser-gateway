@@ -34,8 +34,8 @@ class ExecutorTests(unittest.TestCase):
     def test_extracts_sse_usage_and_request_metadata(self) -> None:
         raw = (
             b"event: response.completed\n"
-            b'data: {"response":{"usage":{"input_tokens":12,"cached_input_tokens":5,'
-            b'"output_tokens":8,"reasoning_output_tokens":3,"total_tokens":20}}}\n\n'
+            b'data: {"response":{"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":5},'
+            b'"output_tokens":8,"output_tokens_details":{"reasoning_tokens":3},"total_tokens":20}}}\n\n'
         )
         self.assertEqual(
             codex_executor._find_usage(raw),

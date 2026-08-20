@@ -451,9 +451,19 @@ def _usage_object(value: object) -> dict[str, int] | None:
         return 0
 
     input_tokens = number("input_tokens", "prompt_tokens")
+    input_details = usage.get("input_tokens_details")
     cached_input_tokens = number("cached_input_tokens")
+    if cached_input_tokens <= 0 and isinstance(input_details, dict):
+        nested_cached = input_details.get("cached_tokens")
+        if isinstance(nested_cached, int) and not isinstance(nested_cached, bool) and nested_cached >= 0:
+            cached_input_tokens = nested_cached
     output_tokens = number("output_tokens", "completion_tokens")
+    output_details = usage.get("output_tokens_details")
     reasoning_output_tokens = number("reasoning_output_tokens")
+    if reasoning_output_tokens <= 0 and isinstance(output_details, dict):
+        nested_reasoning = output_details.get("reasoning_tokens")
+        if isinstance(nested_reasoning, int) and not isinstance(nested_reasoning, bool) and nested_reasoning >= 0:
+            reasoning_output_tokens = nested_reasoning
     total_tokens = number("total_tokens")
     if total_tokens <= 0:
         total_tokens = input_tokens + output_tokens
