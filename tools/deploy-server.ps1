@@ -13,8 +13,12 @@ $ErrorActionPreference = 'Stop'
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $installer = Join-Path $root 'server\install-h2.sh'
 $usageCollector = Join-Path $root 'server\usage_collector.py'
+$codexExecutor = Join-Path $root 'server\codex_executor.py'
+$codexCredentials = Join-Path $root 'server\codex_credentials.py'
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw "Missing installer: $installer" }
 if (-not (Test-Path -LiteralPath $usageCollector -PathType Leaf)) { throw "Missing collector: $usageCollector" }
+if (-not (Test-Path -LiteralPath $codexExecutor -PathType Leaf)) { throw "Missing Codex executor: $codexExecutor" }
+if (-not (Test-Path -LiteralPath $codexCredentials -PathType Leaf)) { throw "Missing Codex credential module: $codexCredentials" }
 if (-not (Test-Path -LiteralPath $IdentityFile -PathType Leaf)) { throw "Missing SSH identity: $IdentityFile" }
 
 $ssh = (Get-Command ssh.exe -ErrorAction Stop).Source
@@ -25,6 +29,10 @@ $common = @('-i', $IdentityFile, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChec
 if ($LASTEXITCODE -ne 0) { throw 'Failed to upload the server installer.' }
 & $scp @common $usageCollector "root@${Server}:/root/browser-gateway-usage-collector.py"
 if ($LASTEXITCODE -ne 0) { throw 'Failed to upload the token usage collector.' }
+& $scp @common $codexExecutor "root@${Server}:/root/browser-gateway-codex-executor.py"
+if ($LASTEXITCODE -ne 0) { throw 'Failed to upload the Codex executor.' }
+& $scp @common $codexCredentials "root@${Server}:/root/browser-gateway-codex-credentials.py"
+if ($LASTEXITCODE -ne 0) { throw 'Failed to upload the Codex credential module.' }
 & $ssh @common "root@$Server" "chmod 0700 /root/browser-gateway-install-h2.sh && /root/browser-gateway-install-h2.sh '$Server' '$Port'"
 if ($LASTEXITCODE -ne 0) { throw 'Server installation failed.' }
 

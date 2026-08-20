@@ -568,6 +568,7 @@ def redeem_enrollment(
     gateway = bootstrap.get("gateway")
     collector_url = bootstrap.get("usageCollectorUrl")
     dashboard_url = bootstrap.get("dashboardUrl")
+    codex_executor_url = bootstrap.get("codexExecutorUrl")
     if not isinstance(gateway, dict) or not isinstance(collector_url, str) or not isinstance(dashboard_url, str):
         raise ValueError("device bootstrap unavailable")
     normalized = code.strip().upper()
@@ -614,6 +615,7 @@ def redeem_enrollment(
         "gateway": gateway,
         "usageCollectorUrl": collector_url,
         "dashboardUrl": dashboard_url,
+        "codexExecutorUrl": codex_executor_url if isinstance(codex_executor_url, str) else "",
     }
 
 
