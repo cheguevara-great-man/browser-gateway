@@ -4,6 +4,8 @@ Browser Gateway 是一个供 Chrome 使用的私有 HTTPS 代理扩展。它让 
 
 当前版本为 **0.4.1**。服务器链路支持 HTTP/2 连接复用、账号认证、可信 TLS 证书、目标访问限制、健康检查和证书自动续期。
 
+本机首次安装和后续一键升级由配套的 FanVPN AI Bridge 管理，详细步骤见 [FanVPN Bridge 安装与升级说明](https://github.com/cheguevara-great-man/fanvpn-bridge/blob/master/docs/INSTALL_AND_UPDATE.md)。首次仍需在 `chrome://extensions` 手工加载 `extension` 目录；以后可在任一扩展的“安装与升级”中完成 Browser Gateway 更新和自动重载。
+
 ## 请求链路
 
 ```text

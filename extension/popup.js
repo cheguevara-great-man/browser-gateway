@@ -3,6 +3,7 @@ const elements = Object.fromEntries([
   "expectedIp", "saveButton", "control", "egress", "latency", "toggleButton", "testButton",
   "enrollmentServer", "enrollmentCode", "enrollButton", "dashboardButton", "enrollmentState",
   "syncBridgeButton",
+  "installRoot", "updateButton",
 ].map((id) => [id, document.getElementById(id)]));
 
 let state = null;
@@ -23,7 +24,7 @@ function showNotice(text = "", error = false) {
 
 function setBusy(value) {
   busy = value;
-  for (const button of [elements.saveButton, elements.toggleButton, elements.testButton, elements.enrollButton, elements.syncBridgeButton]) {
+  for (const button of [elements.saveButton, elements.toggleButton, elements.testButton, elements.enrollButton, elements.syncBridgeButton, elements.updateButton]) {
     button.disabled = value;
   }
   elements.dashboardButton.disabled = value || !state?.config.dashboardAvailable;
@@ -141,6 +142,23 @@ elements.dashboardButton.addEventListener("click", () => {
 
 elements.syncBridgeButton.addEventListener("click", () => {
   perform(() => message({ type: "SYNC_BRIDGE_CONFIG" }), "AI Bridge 用量配置已重新同步");
+});
+
+elements.updateButton.addEventListener("click", () => {
+  perform(async () => {
+    const result = await chrome.runtime.sendMessage(BRIDGE_EXTENSION_ID, {
+      kind: "software-update:run",
+      project: "browser-gateway",
+      installRoot: elements.installRoot.value,
+    });
+    if (result?.ok !== true) throw new Error(result?.message || "Browser Gateway 更新失败");
+    if (result.state?.extension_rebind_required) {
+      showNotice("新目录已准备好；请在 chrome://extensions 对该目录执行一次“加载已解压的扩展程序”。");
+      return message({ type: "GET_STATE" });
+    }
+    setTimeout(() => chrome.runtime.reload(), 400);
+    return message({ type: "GET_STATE" });
+  }, "更新完成，Browser Gateway 将立即重新加载");
 });
 
 setBusy(true);

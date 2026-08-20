@@ -267,6 +267,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
+chrome.runtime.onMessageExternal?.addListener((message, sender, sendResponse) => {
+  if (sender.id !== BRIDGE_EXTENSION_ID || message?.kind !== "software-update:reload") {
+    sendResponse({ ok: false, error: "不受信任的外部操作" });
+    return false;
+  }
+  sendResponse({ ok: true });
+  setTimeout(() => chrome.runtime.reload(), 100);
+  return false;
+});
+
 async function restore() {
   const config = await currentConfig();
   if (config.enabled) {
