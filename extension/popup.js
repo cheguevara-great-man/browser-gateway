@@ -3,7 +3,7 @@ const elements = Object.fromEntries([
   "expectedIp", "saveButton", "control", "egress", "latency", "toggleButton", "testButton",
   "enrollmentServer", "enrollmentCode", "enrollButton", "dashboardButton", "enrollmentState",
   "syncBridgeButton",
-  "installRoot", "pickRootButton", "updateButton",
+  "installRoot", "updateButton",
 ].map((id) => [id, document.getElementById(id)]));
 
 let state = null;
@@ -24,7 +24,7 @@ function showNotice(text = "", error = false) {
 
 function setBusy(value) {
   busy = value;
-  for (const button of [elements.saveButton, elements.toggleButton, elements.testButton, elements.enrollButton, elements.syncBridgeButton, elements.pickRootButton, elements.updateButton]) {
+  for (const button of [elements.saveButton, elements.toggleButton, elements.testButton, elements.enrollButton, elements.syncBridgeButton, elements.updateButton]) {
     button.disabled = value;
   }
   elements.dashboardButton.disabled = value || !state?.config.dashboardAvailable;
@@ -142,17 +142,6 @@ elements.dashboardButton.addEventListener("click", () => {
 
 elements.syncBridgeButton.addEventListener("click", () => {
   perform(() => message({ type: "SYNC_BRIDGE_CONFIG" }), "AI Bridge 用量配置已重新同步");
-});
-
-elements.pickRootButton.addEventListener("click", () => {
-  perform(async () => {
-    const result = await chrome.runtime.sendMessage(BRIDGE_EXTENSION_ID, {
-      kind: "software-update:pick-root", project: "browser-gateway",
-    });
-    if (result?.ok !== true) throw new Error(result?.message || "无法打开文件夹选择窗口");
-    if (typeof result?.state?.path === "string" && result.state.path) elements.installRoot.value = result.state.path;
-    return message({ type: "GET_STATE" });
-  });
 });
 
 elements.updateButton.addEventListener("click", () => {
