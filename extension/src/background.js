@@ -11,6 +11,7 @@ import {
   getProxyState,
   isConfiguredProxy,
 } from "./proxy-controller.js";
+import { PRIVATE_SERVER_ID, effectiveProxyConfig, serverOptions } from "./server-catalog.js";
 
 const authAttempts = new Map();
 let configPromise = null;
@@ -50,8 +51,9 @@ function assertModeReady(config) {
 
 chrome.webRequest.onAuthRequired.addListener(
   (details, callback) => {
-    currentConfig().then((config) => {
-      if (!config.enabled || !sameProxyChallenge(details, config)) {
+    currentConfig().then((saved) => {
+      const config = effectiveProxyConfig(saved);
+      if (!config.enabled || !config.username || !config.password || !sameProxyChallenge(details, config)) {
         callback({});
         return;
       }
@@ -86,11 +88,12 @@ chrome.proxy.onProxyError.addListener((details) => {
 async function statusPayload() {
   const config = await currentConfig();
   const proxy = await getProxyState(chrome.proxy.settings);
-  const active = isConfiguredProxy(proxy, config);
+  const active = isConfiguredProxy(proxy, effectiveProxyConfig(config));
   const conflict = ["not_controllable", "controlled_by_other_extensions"].includes(proxy.levelOfControl);
   return {
     ok: true,
     config: toPublicConfig(config),
+    servers: serverOptions(config),
     active,
     conflict,
     levelOfControl: proxy.levelOfControl,
@@ -103,7 +106,7 @@ async function setEnabled(enabled) {
   let config = await currentConfig();
   if (enabled) {
     assertModeReady(config);
-    await enableProxy(chrome.proxy.settings, config);
+    await enableProxy(chrome.proxy.settings, effectiveProxyConfig(config));
     lastProxyError = null;
   } else {
     await disableProxy(chrome.proxy.settings);
@@ -116,13 +119,18 @@ async function updateConfig(values) {
   const previous = await currentConfig();
   const next = normalizeConfig({ ...values, enabled: previous.enabled }, previous);
   assertModeReady(next);
+  // Match setEnabled: do not persist a new selection if Chrome refuses the proxy change.
+  if (next.enabled) await enableProxy(chrome.proxy.settings, effectiveProxyConfig(next));
   await replaceConfig(next);
-  if (next.enabled) await enableProxy(chrome.proxy.settings, next);
+  if (previous.serverId !== next.serverId || previous.host !== next.host || previous.port !== next.port) {
+    lastTest = null;
+    lastProxyError = null;
+  }
   return statusPayload();
 }
 
 async function testConnection() {
-  const config = await currentConfig();
+  const config = effectiveProxyConfig(await currentConfig());
   assertModeReady(config);
   if (!config.enabled) throw new Error("请先开启代理");
   const proxy = await getProxyState(chrome.proxy.settings);
@@ -214,6 +222,7 @@ async function enrollDevice(serverValue, codeValue) {
   const gateway = result.gateway ?? {};
   const next = normalizeConfig({
     ...previous,
+    serverId: PRIVATE_SERVER_ID,
     host: gateway.host,
     port: gateway.port,
     username: gateway.username,
@@ -227,7 +236,7 @@ async function enrollDevice(serverValue, codeValue) {
     dashboardUrl: result.dashboardUrl,
   }, previous);
   await replaceConfig(next);
-  if (next.enabled) await enableProxy(chrome.proxy.settings, next);
+  if (next.enabled) await enableProxy(chrome.proxy.settings, effectiveProxyConfig(next));
   await applyBridgeDeviceConfig(next);
   return statusPayload();
 }
@@ -283,8 +292,9 @@ async function restore() {
     try {
       assertModeReady(config);
       const proxy = await getProxyState(chrome.proxy.settings);
-      if (!isConfiguredProxy(proxy, config)) {
-        await enableProxy(chrome.proxy.settings, config);
+      const effective = effectiveProxyConfig(config);
+      if (!isConfiguredProxy(proxy, effective)) {
+        await enableProxy(chrome.proxy.settings, effective);
       }
       if (config.routingMode === "direct") return;
       // Chrome restores tabs, extensions, and WebSockets immediately after

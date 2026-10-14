@@ -1,7 +1,10 @@
+import { PRIVATE_SERVER_ID, normalizeServerId } from "./server-catalog.js";
+
 export const STORAGE_KEY = "gatewayConfig";
 export const ROUTING_MODES = Object.freeze(["rule", "global", "direct"]);
 
 export const DEFAULT_CONFIG = Object.freeze({
+  serverId: PRIVATE_SERVER_ID,
   host: "38.207.167.51",
   port: 443,
   username: "",
@@ -71,6 +74,7 @@ export function normalizeConfig(value = {}, previous = DEFAULT_CONFIG) {
     : value.routingMode;
 
   return {
+    serverId: normalizeServerId(value.serverId ?? previous.serverId),
     host: normalizeHost(value.host ?? previous.host),
     port: normalizePort(value.port ?? previous.port),
     username: normalizeCredential(value.username ?? previous.username, "用户名", 128),
@@ -88,6 +92,7 @@ export function normalizeConfig(value = {}, previous = DEFAULT_CONFIG) {
 }
 
 export function assertReady(config) {
+  if (normalizeServerId(config.serverId) !== PRIVATE_SERVER_ID) return;
   if (!config.username || !config.password) {
     throw new Error("请先填写服务器生成的用户名和密码");
   }
@@ -95,6 +100,7 @@ export function assertReady(config) {
 
 export function toPublicConfig(config) {
   return {
+    serverId: normalizeServerId(config.serverId),
     host: config.host,
     port: config.port,
     username: config.username,

@@ -11,7 +11,7 @@
       <header>
         <div>
           <h1>Browser Gateway</h1>
-          <p>私人美国出口</p>
+          <p>私人服务器 / FanVPN 节点</p>
         </div>
         <span id="stateBadge" class="badge off">未开启</span>
       </header>
@@ -35,7 +35,10 @@
       </section>
 
       <form id="settingsForm">
-        <label>代理模式
+        <label class="server-picker">选择服务器
+          <select id="serverId"></select>
+        </label>
+        <label class="mode-picker">代理模式
           <select id="routingMode">
             <option value="rule">规则模式（中国大陆直连）</option>
             <option value="global">全局模式（全部走服务器）</option>

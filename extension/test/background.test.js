@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { FANVPN_SERVERS } from "../src/server-catalog.js";
 
 class FakeEvent {
   listeners = [];
@@ -62,6 +63,7 @@ function createChrome(initialConfig = null) {
     __externalMessages: externalMessages,
     __openedTabs: openedTabs,
     __proxySetCount() { return proxySetCount; },
+    __setLevelOfControl(value) { proxyState.levelOfControl = value; },
   };
 }
 
@@ -225,4 +227,74 @@ test("cold startup restores the proxy once and serves stored credentials", async
     username: "cold-user",
     password: "cold-password",
   });
+});
+
+test("switches FanVPN endpoints without sending private credentials and restores the private server", async () => {
+  globalThis.chrome = createChrome({
+    host: "private.example", port: 8443, username: "private-user", password: "private-secret",
+    expectedIp: "192.0.2.8", enabled: false, routingMode: "global",
+  });
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ip: "198.51.100.9" }; } });
+  await import(`../src/background.js?fanvpn=${Date.now()}`);
+  const listener = chrome.__events.runtimeMessage.listeners[0];
+  const node = FANVPN_SERVERS[0];
+  let selected = await send(listener, { type: "SAVE_CONFIG", config: { serverId: node.id } });
+  assert.equal(selected.ok, true);
+  assert.equal(selected.servers.length, 8);
+  assert.equal(selected.config.host, "private.example");
+  let enabled = await send(listener, { type: "SET_ENABLED", enabled: true });
+  assert.equal(enabled.active, true);
+  let proxy = await new Promise(resolve => chrome.proxy.settings.get({}, resolve));
+  assert.deepEqual(proxy.value.rules.singleProxy, { scheme: "https", host: node.host, port: node.port });
+  const auth = chrome.__events.authRequired.listeners[0];
+  const response = await new Promise(resolve => auth({
+    requestId: "fan", isProxy: true, challenger: { host: node.host, port: node.port },
+  }, resolve));
+  assert.deepEqual(response, {});
+  const tested = await send(listener, { type: "TEST_CONNECTION" });
+  assert.equal(tested.lastTest.ok, true);
+  assert.equal(tested.lastTest.expectedIp, "");
+
+  selected = await send(listener, { type: "SAVE_CONFIG", config: { serverId: FANVPN_SERVERS[1].id } });
+  assert.equal(selected.active, true);
+  assert.equal(selected.lastTest, null);
+  proxy = await new Promise(resolve => chrome.proxy.settings.get({}, resolve));
+  assert.equal(proxy.value.rules.singleProxy.host, FANVPN_SERVERS[1].host);
+
+  selected = await send(listener, { type: "SAVE_CONFIG", config: { serverId: "private" } });
+  assert.equal(selected.active, true);
+  proxy = await new Promise(resolve => chrome.proxy.settings.get({}, resolve));
+  assert.deepEqual(proxy.value.rules.singleProxy, { scheme: "https", host: "private.example", port: 8443 });
+  const privateAuth = await new Promise(resolve => auth({
+    requestId: "private", isProxy: true, challenger: { host: "private.example", port: 8443 },
+  }, resolve));
+  assert.deepEqual(privateAuth.authCredentials, { username: "private-user", password: "private-secret" });
+});
+
+test("FanVPN alone can be enabled with no private password and cold startup retains that node", async () => {
+  globalThis.chrome = createChrome({ serverId: FANVPN_SERVERS[3].id, enabled: true, routingMode: "global" });
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ip: "198.51.100.9" }; } });
+  await import(`../src/background.js?fanvpn-cold=${Date.now()}`);
+  await chrome.runtime.onStartup.listeners[0]();
+  const listener = chrome.__events.runtimeMessage.listeners[0];
+  const state = await send(listener, { type: "GET_STATE" });
+  assert.equal(state.active, true);
+  assert.equal(state.config.serverId, FANVPN_SERVERS[3].id);
+  assert.equal(state.config.hasPassword, false);
+});
+
+test("a refused node switch leaves the saved selection unchanged and never steals proxy control", async () => {
+  globalThis.chrome = createChrome({ serverId: FANVPN_SERVERS[0].id, enabled: false, routingMode: "global" });
+  globalThis.fetch = async () => ({ ok: true, async json() { return { ip: "198.51.100.9" }; } });
+  await import(`../src/background.js?fanvpn-conflict=${Date.now()}`);
+  const listener = chrome.__events.runtimeMessage.listeners[0];
+  await send(listener, { type: "SET_ENABLED", enabled: true });
+  const before = chrome.__proxySetCount();
+  chrome.__setLevelOfControl("controlled_by_other_extensions");
+  const refused = await send(listener, { type: "SAVE_CONFIG", config: { serverId: FANVPN_SERVERS[1].id } });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /其他扩展控制/);
+  assert.equal(chrome.__proxySetCount(), before);
+  const state = await send(listener, { type: "GET_STATE" });
+  assert.equal(state.config.serverId, FANVPN_SERVERS[0].id);
 });

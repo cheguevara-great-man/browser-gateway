@@ -1,5 +1,5 @@
 const elements = Object.fromEntries([
-  "stateBadge", "notice", "settingsForm", "routingMode", "host", "port", "username", "password",
+  "stateBadge", "notice", "settingsForm", "serverId", "routingMode", "host", "port", "username", "password",
   "expectedIp", "saveButton", "control", "egress", "latency", "toggleButton", "testButton",
   "enrollmentServer", "enrollmentCode", "enrollButton", "dashboardButton", "enrollmentState",
   "syncBridgeButton",
@@ -28,25 +28,47 @@ function setBusy(value) {
     button.disabled = value;
   }
   elements.dashboardButton.disabled = value || !state?.config.dashboardAvailable;
+  elements.serverId.disabled = value;
 }
 
 function updateModeForm() {
   const direct = elements.routingMode.value === "direct";
-  elements.username.required = !direct;
+  const privateServer = elements.serverId.value === "private";
+  elements.username.required = privateServer && !direct;
+  for (const field of [elements.username, elements.password, elements.expectedIp]) {
+    field.disabled = !privateServer;
+    field.closest("label").hidden = !privateServer;
+  }
+  elements.host.disabled = !privateServer;
+  elements.port.disabled = !privateServer;
   elements.password.placeholder = direct
     ? "直连模式不需要服务器密码"
     : state?.config?.hasPassword ? "留空保持现有密码" : "请输入服务器密码";
 }
 
+function populateServerFields() {
+  const server = state.servers.find(server => server.id === elements.serverId.value);
+  if (!server) return;
+  elements.host.value = server.host;
+  elements.port.value = server.port;
+  elements.username.value = state.config.username;
+  elements.expectedIp.value = state.config.expectedIp;
+  elements.password.value = "";
+  updateModeForm();
+}
+
 function render(next, populate = false) {
   state = next;
   if (populate) {
-    elements.host.value = next.config.host;
+    elements.serverId.replaceChildren(...next.servers.map(server => {
+      const option = document.createElement("option");
+      option.value = server.id;
+      option.textContent = server.name;
+      return option;
+    }));
+    elements.serverId.value = next.config.serverId;
     elements.routingMode.value = next.config.routingMode;
-    elements.port.value = next.config.port;
-    elements.username.value = next.config.username;
-    elements.expectedIp.value = next.config.expectedIp;
-    updateModeForm();
+    populateServerFields();
     elements.enrollmentServer.value = next.config.enrollmentServer || (next.config.host ? `https://${next.config.host}:9443` : "");
   }
   const active = next.active;
@@ -71,13 +93,16 @@ function render(next, populate = false) {
   elements.syncBridgeButton.hidden = !next.config.enrolled;
   if (conflict) showNotice("Chrome 代理由其他扩展控制。请先关闭 FanVPN 或其他代理扩展。", true);
   else if (next.lastProxyError) showNotice(`${next.lastProxyError.error}: ${next.lastProxyError.details}`, true);
-  else if (next.config.routingMode === "rule") showNotice("规则模式：中国大陆 IPv4、本地和内网地址直连；其他网站走美国服务器。");
+  else if (next.config.routingMode === "rule") showNotice("规则模式：中国大陆 IPv4、本地和内网地址直连；其他网站走所选服务器。");
   else if (next.config.routingMode === "direct") showNotice("直连模式不使用 Browser Gateway，也不会沿用系统代理。");
   else showNotice();
 }
 
 function formConfig() {
+  const selection = { serverId: elements.serverId.value, routingMode: elements.routingMode.value };
+  if (selection.serverId !== "private") return selection;
   return {
+    ...selection,
     host: elements.host.value,
     routingMode: elements.routingMode.value,
     port: Number(elements.port.value),
@@ -108,13 +133,14 @@ elements.settingsForm.addEventListener("submit", (event) => {
 });
 
 elements.routingMode.addEventListener("change", updateModeForm);
+elements.serverId.addEventListener("change", populateServerFields);
 
 elements.toggleButton.addEventListener("click", () => {
   const enable = !state?.config.enabled;
   perform(async () => {
     if (enable) await message({ type: "SAVE_CONFIG", config: formConfig() });
     return message({ type: "SET_ENABLED", enabled: enable });
-  }, enable ? "Chrome 已切换到私人美国出口" : "已恢复 Chrome 原有代理设置");
+  }, enable ? "Chrome 已启用所选代理模式" : "已恢复 Chrome 原有代理设置");
 });
 
 elements.testButton.addEventListener("click", () => {

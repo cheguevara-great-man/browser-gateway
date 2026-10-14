@@ -2,9 +2,19 @@
 
 Browser Gateway 是一个供 Chrome 使用的私有 HTTPS 代理扩展。它让 Chrome，以及 Browser AI Bridge 交给 Chrome 执行的请求，通过你自己的境外服务器访问互联网；Windows 不需要安装 VPN 客户端，也不会开放本地通用代理端口。
 
-当前版本为 **0.4.1**。服务器链路支持 HTTP/2 连接复用、账号认证、可信 TLS 证书、目标访问限制、健康检查和证书自动续期。
+当前版本为 **0.5.3**。服务器链路支持 HTTP/2 连接复用、账号认证、可信 TLS 证书、目标访问限制、健康检查和证书自动续期。
 
 本机首次安装和后续一键升级由配套的 FanVPN AI Bridge 管理，详细步骤见 [FanVPN Bridge 安装与升级说明](https://github.com/cheguevara-great-man/fanvpn-bridge/blob/master/docs/INSTALL_AND_UPDATE.md)。首次仍需在 `chrome://extensions` 手工加载 `extension` 目录；以后可在任一扩展的“安装与升级”中完成 Browser Gateway 更新和自动重载。
+
+## 选择服务器
+
+弹窗的“选择服务器”提供原有私人服务器和从本机 FanVPN 1.6.3 配置解析出的 7 个 HTTPS 节点。
+选择后点击“保存设置”；如果代理已经开启，会立即切换，否则再点击“开启”即可。
+FanVPN 节点不使用私人服务器的账号密码，切回私人服务器时仍保留原有配置。
+这是节点列表快照，不跟随或控制 FanVPN 插件，也不自动改选其他节点。节点可用性由 FanVPN 服务方决定。
+使用时请在 `chrome://extensions` 停用 FanVPN 扩展，避免两个插件争抢 Chrome 代理控制权；
+FanVPN 的“断开”操作仍会设置 Chrome 的系统代理模式，不一定释放扩展控制权。停用它不影响这里已解析的节点列表。
+分流仍使用 Browser Gateway 自己的规则。
 
 ## 请求链路
 
